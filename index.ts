@@ -285,7 +285,7 @@ async function buildPiArgs(
 	agent: AgentConfig,
 	task: string,
 	cwd: string,
-): Promise<{ args: string[]; tempDir: string; childEnv: NodeJS.ProcessEnv | undefined }> {
+): Promise<{ args: string[]; tempDir: string; childEnv: NodeJS.ProcessEnv }> {
 	const piBin = resolvePiBinary();
 	const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-sub-"));
 
@@ -349,14 +349,13 @@ async function buildPiArgs(
 		args.push(`Task: ${task}`);
 	}
 
-	// If this agent is allowed to spawn subagents AND we want to restrict which
-	// ones, pass the allowlist down via env. The child pi process loads this
-	// extension and filters its agent registry before exposing tool descriptions
-	// to the LLM — so the child literally cannot request an agent outside the
-	// allowlist (the name isn't in its prompt).
-	let childEnv: NodeJS.ProcessEnv | undefined;
+	// Always mark child processes so extensions (register-agents.ts) can detect
+	// them and skip tool blocking. Child agents need full tool access.
+	const childEnv: NodeJS.ProcessEnv = { ...process.env, PI_IS_SUBAGENT: "1" };
+
+	// If this agent has a spawn allowlist, restrict which agents the child sees
 	if (agent.tools.includes("subagent") && agent.subagentAgents && agent.subagentAgents.length > 0) {
-		childEnv = { ...process.env, PI_SUBAGENT_ALLOWED: agent.subagentAgents.join(",") };
+		childEnv.PI_SUBAGENT_ALLOWED = agent.subagentAgents.join(",");
 	}
 
 	return { args: [piBin.command, ...args], tempDir, childEnv };
@@ -447,7 +446,7 @@ async function runSubagent(
 		const proc = spawn(command, spawnArgs, {
 			cwd,
 			stdio: ["ignore", "pipe", "pipe"],
-			...(childEnv ? { env: childEnv } : {}),
+			env: childEnv,
 		});
 
 		let buf = "";
