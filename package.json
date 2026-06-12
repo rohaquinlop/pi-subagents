@@ -1,0 +1,9 @@
+{
+  "name": "pi-subagents",
+  "version": "1.0.0",
+  "description": "Pi subagents extension",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
