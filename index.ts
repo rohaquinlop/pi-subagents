@@ -8,9 +8,9 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@mariozechner/pi-coding-agent";
-import { Container, Markdown, Spacer, Text, visibleWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
+import { Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -113,12 +113,10 @@ const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", 
 // Custom tools that require loading an extension into the subagent process
 const EXT_BASE = path.join(process.env.HOME || "~", ".pi", "agent", "extensions");
 const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
-	web_search: path.join(EXT_BASE, "web-search", "index.ts"),
-	web_fetch: path.join(EXT_BASE, "web-fetch", "index.ts"),
+	// web_search and web_fetch are provided by the web-research extension
+	web_search: path.join(EXT_BASE, "web-research", "index.ts"),
+	web_fetch: path.join(EXT_BASE, "web-research", "index.ts"),
 	safe_bash: path.join(TOOLS_DIR, "safe-bash.ts"),
-	video_extract: path.join(EXT_BASE, "video-extract", "index.ts"),
-	youtube_search: path.join(EXT_BASE, "youtube-search", "index.ts"),
-	google_image_search: path.join(EXT_BASE, "google-image-search", "index.ts"),
 	// `subagent` is the tool this very extension registers. Listing it here lets
 	// a parent agent grant it to a child agent — the child pi process loads this
 	// same index.ts via `--extension`, sees its own subagent tool, and (if
@@ -177,7 +175,7 @@ function loadAgents(): AgentConfig[] {
 			name: frontmatter.name,
 			description: frontmatter.description || "",
 			tools,
-			model: frontmatter.model || "anthropic/claude-sonnet-4-6",
+			model: frontmatter.model || "nan/deepseek-v4-flash",
 			thinking: frontmatter.thinking || "medium",
 			systemPrompt: body,
 			filePath,
@@ -303,6 +301,13 @@ async function buildPiArgs(
 	// --tools allowlist in pi; --no-tools would disable extension tools too.
 	const allowlist: string[] = [];
 	const extensionPaths = new Set<string>();
+
+	// The nan-builders extension registers the "nan" provider.
+	// Child processes need it to use nan models.
+	const NAN_BUILDERS_EXT = path.join(EXT_BASE, "nan-builders.ts");
+	if (fs.existsSync(NAN_BUILDERS_EXT)) {
+		extensionPaths.add(NAN_BUILDERS_EXT);
+	}
 
 	for (const tool of agent.tools) {
 		if (BUILTIN_TOOLS.has(tool)) {
