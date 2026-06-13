@@ -110,6 +110,9 @@ function loadConfig(): ExtensionConfig {
 // Built-in tools that pi provides natively (no extension needed)
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
 
+// Directories for user-defined agents (merged over built-ins by name)
+const USER_AGENTS_DIR = path.join(process.env.HOME || "~", ".pi", "agent", "extensions", "agents");
+
 // Custom tools that require loading an extension into the subagent process
 const EXT_BASE = path.join(process.env.HOME || "~", ".pi", "agent", "extensions");
 const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
@@ -154,15 +157,15 @@ export function unregisterAgent(name: string): void {
 // (which creates separate module instances) can access the shared agents array.
 (globalThis as any).__pi_subagents = { registerAgent, unregisterAgent };
 
-function loadAgents(): AgentConfig[] {
-	const agents: AgentConfig[] = [];
-	if (!fs.existsSync(AGENTS_DIR)) return agents;
-	for (const entry of fs.readdirSync(AGENTS_DIR)) {
-		if (!entry.endsWith(".md")) continue;
-		const filePath = path.join(AGENTS_DIR, entry);
+/**
+ * Parse a single agent .md file into an AgentConfig.
+ * Returns null if the file is invalid or has no `name` in frontmatter.
+ */
+function parseAgentFile(filePath: string): AgentConfig | null {
+	try {
 		const content = fs.readFileSync(filePath, "utf-8");
 		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
-		if (!frontmatter.name) continue;
+		if (!frontmatter.name) return null;
 		const tools = (frontmatter.tools || "")
 			.split(",")
 			.map((t) => t.trim())
@@ -171,7 +174,7 @@ function loadAgents(): AgentConfig[] {
 		const subagentAgents = rawSubagentAgents
 			? rawSubagentAgents.split(",").map((t) => t.trim()).filter(Boolean)
 			: undefined;
-		agents.push({
+		return {
 			name: frontmatter.name,
 			description: frontmatter.description || "",
 			tools,
@@ -180,9 +183,44 @@ function loadAgents(): AgentConfig[] {
 			systemPrompt: body,
 			filePath,
 			subagentAgents,
-		});
+		};
+	} catch {
+		return null;
 	}
-	return agents;
+}
+
+/**
+ * Load all agents from both built-in and user directories.
+ *
+ * 1. Load built-in agents from pi-subagents/agents/
+ * 2. Load user-defined agents from ~/.pi/agent/extensions/agents/
+ *    User agents with the same name as a built-in replace it.
+ *
+ * The SUBAGENT_ALLOWLIST filter (applied later in the default export)
+ * still restricts which agents child subagent processes can see.
+ */
+function loadAgents(): AgentConfig[] {
+	const byName = new Map<string, AgentConfig>();
+
+	// 1. Load built-in agents
+	if (fs.existsSync(AGENTS_DIR)) {
+		for (const entry of fs.readdirSync(AGENTS_DIR)) {
+			if (!entry.endsWith(".md")) continue;
+			const agent = parseAgentFile(path.join(AGENTS_DIR, entry));
+			if (agent) byName.set(agent.name, agent);
+		}
+	}
+
+	// 2. Load user-defined agents (overwrites built-ins with the same name)
+	if (fs.existsSync(USER_AGENTS_DIR)) {
+		for (const entry of fs.readdirSync(USER_AGENTS_DIR)) {
+			if (!entry.endsWith(".md")) continue;
+			const agent = parseAgentFile(path.join(USER_AGENTS_DIR, entry));
+			if (agent) byName.set(agent.name, agent);
+		}
+	}
+
+	return Array.from(byName.values());
 }
 
 // ── Pi Binary Resolution ──────────────────────────────────────────────
