@@ -784,7 +784,20 @@ function renderAgentProgress(
 	// Tool log — running and done interleaved in chronological order. Running
 	// entries get the `▸` marker; done ones get a muted `  ` prefix. Children
 	// (live subagent activity) render inline beneath each row.
-	for (const t of prog.recentTools) {
+	//
+	// In collapsed view, show only the latest 6 tool calls to keep output
+	// compact. Expanded view (ctrl+o) shows everything.
+	const MAX_COLLAPSED_TOOLS = 6;
+	const toolsToShow = expanded
+		? prog.recentTools
+		: prog.recentTools.slice(-MAX_COLLAPSED_TOOLS);
+	const hiddenCount = expanded ? 0 : Math.max(0, prog.recentTools.length - MAX_COLLAPSED_TOOLS);
+
+	if (hiddenCount > 0) {
+		addLine(theme.fg("muted", `  … ${hiddenCount} earlier tool call${hiddenCount === 1 ? "" : "s"}`));
+	}
+
+	for (const t of toolsToShow) {
 		renderToolRow(t.tool, t.args, t.children, t.status === "running");
 	}
 
