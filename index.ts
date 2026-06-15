@@ -115,17 +115,61 @@ const USER_AGENTS_DIR = path.join(process.env.HOME || "~", ".pi", "agent", "exte
 
 // Custom tools that require loading an extension into the subagent process
 const EXT_BASE = path.join(process.env.HOME || "~", ".pi", "agent", "extensions");
-const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
-	// web_search and web_fetch are provided by the web-research extension
-	web_search: path.join(EXT_BASE, "web-research", "index.ts"),
-	web_fetch: path.join(EXT_BASE, "web-research", "index.ts"),
-	safe_bash: path.join(TOOLS_DIR, "safe-bash.ts"),
-	// `subagent` is the tool this very extension registers. Listing it here lets
-	// a parent agent grant it to a child agent — the child pi process loads this
-	// same index.ts via `--extension`, sees its own subagent tool, and (if
-	// PI_SUBAGENT_ALLOWED is set) only registers the allowlisted agents.
-	subagent: path.join(EXT_DIR, "index.ts"),
-};
+
+/**
+ * Dynamically discover tool-to-extension mappings by scanning EXT_BASE
+ * for pi.registerTool({ name: "...", ... }) calls in every extension file.
+ *
+ * Scans both directory-based extensions (dir/index.ts) and single-file
+ * extensions (dir.ts). Skips built-in tool re-registrations (e.g.
+ * compact-tool-renderer's rendering overrides) and provider-only files.
+ * Falls back to hardcoded entries for tools in non-standard locations
+ * (safe_bash in TOOLS_DIR, subagent in EXT_DIR).
+ */
+function buildCustomToolExtensions(): Record<string, string> {
+	const map: Record<string, string> = {};
+
+	try {
+		const entries = fs.readdirSync(EXT_BASE, { withFileTypes: true });
+		for (const entry of entries) {
+			let extPath: string | undefined;
+
+			if (entry.isDirectory()) {
+				const indexPath = path.join(EXT_BASE, entry.name, "index.ts");
+				if (fs.existsSync(indexPath)) extPath = indexPath;
+			} else if (entry.isFile() && entry.name.endsWith(".ts")) {
+				// Skip provider-only extensions (they register no tools)
+				if (entry.name === "nan-builders.ts") continue;
+				extPath = path.join(EXT_BASE, entry.name);
+			}
+
+			if (!extPath) continue;
+
+			const content = fs.readFileSync(extPath, "utf-8");
+			// Extract tool names from pi.registerTool({ name: "toolname", ... }) calls
+			const toolNameRe = /name:\s*"([^"]+)"/g;
+			let match: RegExpExecArray | null;
+			while ((match = toolNameRe.exec(content)) !== null) {
+				const toolName = match[1];
+				// Skip built-in tool re-registrations (e.g. compact-tool-renderer
+				// which overrides read/write/edit/bash/grep/ls/find rendering)
+				if (!BUILTIN_TOOLS.has(toolName)) {
+					map[toolName] = extPath;
+				}
+			}
+		}
+	} catch {
+		// EXT_BASE might not exist yet at module load time
+	}
+
+	// Hardcoded entries for tools in non-standard locations not under EXT_BASE
+	map.safe_bash ??= path.join(TOOLS_DIR, "safe-bash.ts");
+	map.subagent ??= path.join(EXT_DIR, "index.ts");
+
+	return map;
+}
+
+const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = buildCustomToolExtensions();
 
 // ── Agent Discovery & Registration ────────────────────────────────────
 
