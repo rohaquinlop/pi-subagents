@@ -1,6 +1,12 @@
-# Minimal Subagents
+# @rohaquinlop/pi-subagents
 
 A [pi](https://github.com/earendil-works/pi) extension that registers a single `subagent` tool with three agents:
+
+## Installation
+
+```bash
+pi install @rohaquinlop/pi-subagents
+```
 
 | Agent | Tools | Model | Purpose |
 |-------|-------|-------|---------|
@@ -156,9 +162,10 @@ The `subagent` tool itself is listed in `CUSTOM_TOOL_EXTENSIONS` pointing back t
 ## Structure
 
 ```
-subagents/
+@rohaquinlop/pi-subagents/
 ├── index.ts           # Extension entry point
 ├── agents/            # Built-in agent configs (frontmatter + system prompt)
+├── lib/               # Pure helper functions (agent discovery, frontmatter parsing)
 └── tools/             # Extensions loaded into subagent processes
     └── safe-bash.ts   # bash with dangerous command blocking
 ```
