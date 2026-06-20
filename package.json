@@ -1,8 +1,14 @@
 {
   "name": "@rohaquinlop/pi-subagents",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Pi extension for delegating tasks to subagents — parallel execution, agent discovery, and TUI rendering",
-  "keywords": ["pi-package", "subagent", "parallel", "coding-agent", "extension"],
+  "keywords": [
+    "pi-package",
+    "subagent",
+    "parallel",
+    "coding-agent",
+    "extension"
+  ],
   "license": "MIT",
   "author": "rohaquinlop",
   "repository": {
@@ -17,7 +23,9 @@
     "README.md"
   ],
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
