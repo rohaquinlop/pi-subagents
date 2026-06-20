@@ -10,9 +10,9 @@ pi install @rohaquinlop/pi-subagents
 
 | Agent | Tools | Model | Purpose |
 |-------|-------|-------|---------|
-| **scout** | read, grep, find, ls | claude-haiku-4-5 | Fast codebase recon |
-| **researcher** | web_search, web_fetch | claude-sonnet-4-6 | Web research |
-| **worker** | read, write, edit, safe_bash, web_search, web_fetch, subagent | claude-sonnet-4-6 | Code changes (can dispatch scout/researcher to protect its own context) |
+| **scout** | read, grep, find, ls | deepseek-v4-flash | Fast codebase recon |
+| **researcher** | web_search, web_fetch | deepseek-v4-flash | Web research |
+| **worker** | read, write, edit, safe_bash, web_search, web_fetch, subagent | deepseek-v4-flash | Code changes (can dispatch scout/researcher to protect its own context) |
 
 `worker` is allowlisted to spawn only `scout` and `researcher` (via `subagent_agents` in its frontmatter), so the chain stops at depth 2 — a worker cannot recurse into another worker.
 
@@ -75,7 +75,7 @@ Frontmatter fields:
 - **name** (required) — unique agent name, used in `{ agent: "my-agent" }` calls
 - **description** — short description
 - **tools** — comma-separated list of tools the agent needs (builtin or extension). Include `subagent` here to let this agent spawn other agents.
-- **model** — model identifier (defaults to `anthropic/claude-sonnet-4-6`)
+- **model** — provider-agnostic model identifier (e.g. `deepseek-v4-flash`). Pi resolves it from any registered provider that serves it.
 - **thinking** — reasoning level: `off`, `low`, `medium`, `high` (defaults to `medium`)
 - **subagent_agents** — if `subagent` is in `tools`, restrict which agents this one may spawn. Comma-separated list of agent names. Omit for no restriction. Enforced by passing `PI_SUBAGENT_ALLOWED` env to the child `pi` process — the child's subagents extension filters its registry before any tool description sees it, so the child LLM literally can't reference an agent outside the allowlist.
 
