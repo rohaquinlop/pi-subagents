@@ -9,28 +9,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
+import "./tools/safe-bash";
 
-// ── Types ──────────────────────────────────────────────────────────────
-
-export interface AgentConfig {
-	name: string;
-	description: string;
-	tools: string[];
-	model: string;
-	thinking: string;
-	systemPrompt: string;
-	filePath: string;
-	/**
-	 * If this agent has the `subagent` tool, restrict which agents it may spawn.
-	 * Passed to the child pi process via `PI_SUBAGENT_ALLOWED` so the child's
-	 * subagents extension filters its own registry before exposing it to the LLM.
-	 * `undefined` means no restriction (child sees every registered agent).
-	 */
-	subagentAgents?: string[];
-}
+import type { AgentConfig } from "./lib/types";
+import { discoverAgents, mergeAgents } from "./lib/helpers";
 
 interface ToolEvent {
 	tool: string;
@@ -201,37 +186,7 @@ export function unregisterAgent(name: string): void {
 // (which creates separate module instances) can access the shared agents array.
 (globalThis as any).__pi_subagents = { registerAgent, unregisterAgent };
 
-/**
- * Parse a single agent .md file into an AgentConfig.
- * Returns null if the file is invalid or has no `name` in frontmatter.
- */
-function parseAgentFile(filePath: string): AgentConfig | null {
-	try {
-		const content = fs.readFileSync(filePath, "utf-8");
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
-		if (!frontmatter.name) return null;
-		const tools = (frontmatter.tools || "")
-			.split(",")
-			.map((t) => t.trim())
-			.filter(Boolean);
-		const rawSubagentAgents = (frontmatter as Record<string, string>).subagent_agents;
-		const subagentAgents = rawSubagentAgents
-			? rawSubagentAgents.split(",").map((t) => t.trim()).filter(Boolean)
-			: undefined;
-		return {
-			name: frontmatter.name,
-			description: frontmatter.description || "",
-			tools,
-			model: frontmatter.model || "nan/deepseek-v4-flash",
-			thinking: frontmatter.thinking || "medium",
-			systemPrompt: body,
-			filePath,
-			subagentAgents,
-		};
-	} catch {
-		return null;
-	}
-}
+
 
 /**
  * Load all agents from both built-in and user directories.
@@ -244,27 +199,9 @@ function parseAgentFile(filePath: string): AgentConfig | null {
  * still restricts which agents child subagent processes can see.
  */
 function loadAgents(): AgentConfig[] {
-	const byName = new Map<string, AgentConfig>();
-
-	// 1. Load built-in agents
-	if (fs.existsSync(AGENTS_DIR)) {
-		for (const entry of fs.readdirSync(AGENTS_DIR)) {
-			if (!entry.endsWith(".md")) continue;
-			const agent = parseAgentFile(path.join(AGENTS_DIR, entry));
-			if (agent) byName.set(agent.name, agent);
-		}
-	}
-
-	// 2. Load user-defined agents (overwrites built-ins with the same name)
-	if (fs.existsSync(USER_AGENTS_DIR)) {
-		for (const entry of fs.readdirSync(USER_AGENTS_DIR)) {
-			if (!entry.endsWith(".md")) continue;
-			const agent = parseAgentFile(path.join(USER_AGENTS_DIR, entry));
-			if (agent) byName.set(agent.name, agent);
-		}
-	}
-
-	return Array.from(byName.values());
+	const builtIn = discoverAgents(AGENTS_DIR);
+	const user = discoverAgents(USER_AGENTS_DIR);
+	return mergeAgents(builtIn, user);
 }
 
 // ── Pi Binary Resolution ──────────────────────────────────────────────
