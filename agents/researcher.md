@@ -2,7 +2,7 @@
 name: researcher
 description: Web researcher — searches the web and synthesizes findings
 tools: web_search, web_fetch
-model: nan/deepseek-v4-flash
+model: deepseek-v4-flash
 thinking: medium
 ---
 
