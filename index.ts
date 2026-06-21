@@ -156,6 +156,43 @@ function buildCustomToolExtensions(): Record<string, string> {
 
 const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = buildCustomToolExtensions();
 
+interface ModelExtension {
+	patterns: string[];
+	path: string;
+}
+
+function buildModelExtensions(): ModelExtension[] {
+	const result: ModelExtension[] = [];
+	try {
+		const entries = fs.readdirSync(EXT_BASE, { withFileTypes: true });
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			const pkgPath = path.join(EXT_BASE, entry.name, "package.json");
+			if (!fs.existsSync(pkgPath)) continue;
+			try {
+				const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+				const patterns: unknown = pkg?.pi?.appliesToModels;
+				const extEntries: unknown = pkg?.pi?.extensions;
+				if (!Array.isArray(patterns) || patterns.length === 0) continue;
+				if (!patterns.every((p: unknown): p is string => typeof p === "string")) continue;
+				if (!Array.isArray(extEntries) || extEntries.length === 0) continue;
+				if (!extEntries.every((e: unknown): e is string => typeof e === "string")) continue;
+				const extPath = path.join(EXT_BASE, entry.name, extEntries[0]);
+				if (fs.existsSync(extPath)) {
+					result.push({ patterns, path: extPath });
+				}
+			} catch {
+				// skip corrupted package.json
+			}
+		}
+	} catch {
+		// skip if EXT_BASE doesn't exist
+	}
+	return result;
+}
+
+const MODEL_EXTENSIONS: ModelExtension[] = buildModelExtensions();
+
 // ── Agent Discovery & Registration ────────────────────────────────────
 
 let agents: AgentConfig[] = [];
@@ -300,6 +337,27 @@ function truncLine(text: string, maxWidth: number): string {
 
 // ── Subagent Execution ────────────────────────────────────────────────
 
+/**
+ * Match a model string against a glob-style pattern (supports only `*` as wildcard).
+ * Pattern "deepseek-*" matches "nan/deepseek-v4-flash" and "deepseek-v4-pro".
+ * Pattern without wildcards (e.g. "deepseek") matches any model from that provider.
+ */
+function matchModelPattern(model: string, pattern: string): boolean {
+	const slashIdx = model.indexOf("/");
+	const hasProvider = slashIdx !== -1;
+	const modelId = hasProvider ? model.slice(slashIdx + 1) : model;
+	const provider = hasProvider ? model.slice(0, slashIdx) : "";
+
+	// Pattern without wildcards: match against provider name
+	if (!pattern.includes("*") && hasProvider) {
+		return provider.toLowerCase() === pattern.toLowerCase();
+	}
+
+	// Glob pattern: match against model ID
+	const regex = new RegExp("^" + pattern.replace(/\*/g, ".*") + "$", "i");
+	return regex.test(modelId);
+}
+
 async function buildPiArgs(
 	agent: AgentConfig,
 	task: string,
@@ -346,6 +404,16 @@ async function buildPiArgs(
 	} else {
 		// Agent declared no tools — disable everything.
 		args.push("--no-tools");
+	}
+
+	// Auto-load model-specific extensions (e.g. deepseek-cache)
+	for (const me of MODEL_EXTENSIONS) {
+		for (const pattern of me.patterns) {
+			if (matchModelPattern(agent.model, pattern)) {
+				extensionPaths.add(me.path);
+				break;
+			}
+		}
 	}
 
 	for (const extPath of extensionPaths) {

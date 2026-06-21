@@ -159,6 +159,24 @@ Built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) work auto
 
 The `subagent` tool itself is listed in `CUSTOM_TOOL_EXTENSIONS` pointing back to this extension's own `index.ts` — that's how an agent like `worker` can recursively spawn other agents. Recursion is bounded only by each agent's `subagent_agents` allowlist (e.g. worker can spawn scout/researcher, neither of which declares the `subagent` tool, so the chain stops at depth 2).
 
+### 4. Model-specific extensions (no manual mapping)
+
+Extensions that apply to specific models (not tools) can declare `appliesToModels`
+in their `package.json` and auto-load without any `CUSTOM_TOOL_EXTENSIONS` mapping:
+
+```json
+{
+  "pi": {
+    "extensions": ["./extensions/index.ts"],
+    "appliesToModels": ["deepseek-*", "deepseek"]
+  }
+}
+```
+
+When a subagent's configured model matches one of the patterns, the extension is
+loaded via `--extension` in the child process. Glob patterns (`*` wildcard) match
+model IDs; plain strings without wildcards match provider names.
+
 ## Structure
 
 ```
