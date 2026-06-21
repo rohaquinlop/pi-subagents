@@ -168,14 +168,17 @@ in their `package.json` and auto-load without any `CUSTOM_TOOL_EXTENSIONS` mappi
 {
   "pi": {
     "extensions": ["./extensions/index.ts"],
-    "appliesToModels": ["deepseek-*", "deepseek"]
+    "appliesToModels": ["deepseek-*"]
   }
 }
 ```
 
 When a subagent's configured model matches one of the patterns, the extension is
 loaded via `--extension` in the child process. Glob patterns (`*` wildcard) match
-model IDs; plain strings without wildcards match provider names.
+the **model ID** (the portion after the last `/`, e.g. `deepseek-v4-flash` in
+`nan/deepseek-v4-flash`). Plain strings without wildcards match the **provider
+name** (the portion before the `/`, e.g. `nan` in `nan/deepseek-v4-flash`).
+Matching is case-insensitive.
 
 ## Structure
 
