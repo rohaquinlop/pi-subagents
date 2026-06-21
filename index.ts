@@ -340,7 +340,7 @@ function truncLine(text: string, maxWidth: number): string {
 /**
  * Match a model string against a glob-style pattern (supports only `*` as wildcard).
  * Pattern "deepseek-*" matches "nan/deepseek-v4-flash" and "deepseek-v4-pro".
- * Pattern without wildcards (e.g. "deepseek") matches any model from that provider.
+ * Plain strings without wildcards match the provider name (portion before `/`).
  */
 function matchModelPattern(model: string, pattern: string): boolean {
 	const slashIdx = model.indexOf("/");
@@ -354,7 +354,9 @@ function matchModelPattern(model: string, pattern: string): boolean {
 	}
 
 	// Glob pattern: match against model ID
-	const regex = new RegExp("^" + pattern.replace(/\*/g, ".*") + "$", "i");
+	// Escape regex-special characters, then convert escaped * back to .*
+	const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\\*/g, ".*");
+	const regex = new RegExp("^" + escaped + "$", "i");
 	return regex.test(modelId);
 }
 
