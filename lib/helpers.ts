@@ -50,8 +50,11 @@ export function parseAgentMd(content: string, filePath: string): AgentConfig | n
     const subagentAgents = fields.subagent_agents
         ? normalizeTools(fields.subagent_agents)
         : undefined;
+    const connector = fields.connector
+        ? fields.connector.replace(/^"|"$/g, "")
+        : undefined;
 
-    return { name, description, tools, model, thinking, systemPrompt, filePath, subagentAgents };
+    return { name, description, tools, model, thinking, systemPrompt, filePath, subagentAgents, connector };
 }
 
 /**
@@ -88,6 +91,34 @@ export function mergeAgents(builtIn: AgentConfig[], user: AgentConfig[]): AgentC
         byName.set(agent.name, agent);
     }
     return Array.from(byName.values());
+}
+
+/**
+ * Replace {previous} placeholder in a task string with the prior step's output.
+ * Truncation happens here — this is the single truncation point.
+ */
+export function substitutePlaceholders(
+    task: string,
+    previousOutput: string,
+    maxContextChars: number = 16000,
+): string {
+    const truncated = previousOutput.length > maxContextChars
+        ? previousOutput.slice(0, maxContextChars) + "\n\n[Context truncated for pipeline]"
+        : previousOutput;
+    return task.replace(/\{previous\}/g, truncated);
+}
+
+/**
+ * Format an agent's output using its connector template.
+ * Pure formatting function — does NOT truncate. Truncation is handled
+ * by substitutePlaceholders() before this is called.
+ */
+export function formatConnectorContext(
+    output: string,
+    connectorTemplate?: string,
+): string {
+    if (!connectorTemplate) return output;
+    return connectorTemplate.replace(/\{output\}/g, output);
 }
 
 /**

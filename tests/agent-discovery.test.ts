@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mergeAgents, type AgentConfig } from "../lib/helpers";
+import { mergeAgents, parseAgentMd, substitutePlaceholders, formatConnectorContext, type AgentConfig } from "../lib/helpers";
 
 function makeAgent(name: string, description: string): AgentConfig {
     return {
@@ -43,5 +43,73 @@ describe("mergeAgents", () => {
     it("handles empty user", () => {
         const builtIn = [makeAgent("scout", "Scout")];
         expect(mergeAgents(builtIn, [])).toEqual(builtIn);
+    });
+});
+
+describe("parseAgentMd", () => {
+    it("parses connector from frontmatter with surrounding quotes stripped", () => {
+        const content = `---\nname: scout\ndescription: Fast recon\ntools: read,ls\nmodel: deepseek-v4-flash\nthinking: medium\nconnector: "## Key findings\\n\\n{output}"\n---\nYou are a scout agent.`;
+        const result = parseAgentMd(content, "agents/scout.md");
+        expect(result).not.toBeNull();
+        expect(result!.connector).toBe("## Key findings\\n\\n{output}");
+    });
+
+    it("returns undefined connector when not present", () => {
+        const content = `---
+name: scout
+description: Fast recon
+tools: read,ls
+model: deepseek-v4-flash
+thinking: medium
+---
+You are a scout agent.`;
+        const result = parseAgentMd(content, "agents/scout.md");
+        expect(result).not.toBeNull();
+        expect(result!.connector).toBeUndefined();
+    });
+});
+
+describe("substitutePlaceholders", () => {
+    it("replaces {previous} with prior output", () => {
+        const result = substitutePlaceholders("Based on {previous}, do X", "found stuff");
+        expect(result).toBe("Based on found stuff, do X");
+    });
+
+    it("replaces multiple {previous} occurrences", () => {
+        const result = substitutePlaceholders("{previous} and {previous}", "data");
+        expect(result).toBe("data and data");
+    });
+
+    it("truncates at maxContextChars", () => {
+        const longOutput = "x".repeat(20000);
+        const result = substitutePlaceholders("{previous}", longOutput, 16000);
+        expect(result).toBe("x".repeat(16000) + "\n\n[Context truncated for pipeline]");
+    });
+
+    it("does not truncate when under limit", () => {
+        const result = substitutePlaceholders("{previous}", "short", 16000);
+        expect(result).toBe("short");
+    });
+
+    it("returns task unchanged when no placeholder present", () => {
+        const result = substitutePlaceholders("No placeholder here", "ignored");
+        expect(result).toBe("No placeholder here");
+    });
+});
+
+describe("formatConnectorContext", () => {
+    it("applies connector template with {output}", () => {
+        const result = formatConnectorContext("raw output", "## Findings\n\n{output}");
+        expect(result).toBe("## Findings\n\nraw output");
+    });
+
+    it("returns raw output when no template provided", () => {
+        const result = formatConnectorContext("raw output", undefined);
+        expect(result).toBe("raw output");
+    });
+
+    it("handles template with multiple {output} placeholders", () => {
+        const result = formatConnectorContext("data", "{output} vs {output}");
+        expect(result).toBe("data vs data");
     });
 });
