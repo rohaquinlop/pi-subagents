@@ -4,6 +4,7 @@ description: Fast codebase recon — explores files, finds patterns, maps archit
 tools: read, grep, find, ls
 model: deepseek-v4-flash
 thinking: medium
+connector: "## Key findings from codebase exploration:\n\n{output}"
 ---
 
 You are a scout agent. Quickly investigate a codebase and return structured findings.

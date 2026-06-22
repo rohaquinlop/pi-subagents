@@ -5,6 +5,7 @@ tools: read, write, edit, safe_bash, web_search, web_fetch, subagent
 subagent_agents: scout, researcher
 model: deepseek-v4-flash
 thinking: medium
+connector: "## Implementation results:\n\n{output}"
 ---
 
 You are a worker agent. You operate in an isolated context — you have no knowledge of any prior conversation.
