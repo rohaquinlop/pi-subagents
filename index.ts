@@ -14,7 +14,7 @@ import { Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works
 import { Type } from "@sinclair/typebox";
 import "./tools/safe-bash";
 
-import type { AgentConfig } from "./lib/types";
+import type { AgentConfig, AgentUsage } from "./lib/types";
 import { discoverAgents, mergeAgents } from "./lib/helpers";
 
 interface ToolEvent {
@@ -64,7 +64,7 @@ interface AgentResult {
 	progress: AgentProgress;
 	model?: string;
 	contextWindow?: number;
-	usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; turns: number };
+	usage: AgentUsage;
 }
 
 interface Details {
