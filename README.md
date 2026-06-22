@@ -1,6 +1,6 @@
 # @rohaquinlop/pi-subagents
 
-A [pi](https://github.com/earendil-works/pi) extension that registers a single `subagent` tool with three agents:
+A [pi](https://github.com/earendil-works/pi) extension that registers three agent orchestration tools — `subagent`, `pipeline`, and `loop` — with three built-in agents:
 
 ## Installation
 
@@ -22,6 +22,8 @@ pi install @rohaquinlop/pi-subagents
 
 ## Usage
 
+### Subagent — Single Agent Dispatch
+
 One tool call = one subagent:
 ```json
 { "agent": "scout", "task": "Find all auth-related files in src/" }
@@ -30,6 +32,49 @@ One tool call = one subagent:
 To fan out, emit multiple `subagent` tool calls in the same assistant turn — pi runs them in parallel automatically. A per-process semaphore caps simultaneous subagents at `maxConcurrency` (default 4); calls past the cap wait their turn.
 
 Each subagent runs as an isolated `pi` process with no inherited context — all context must be in the task description.
+
+### Pipeline — Sequential Agent Chains
+
+Chain 2–5 agents in sequence where each agent's output feeds as context into the next. Use `{previous}` in a step's task to inject the prior step's output.
+
+```json
+{ "tool": "pipeline", "args": { "steps": [
+  { "agent": "scout", "task": "Find all auth-related code in src/" },
+  { "agent": "worker", "task": "Based on these findings:\n{previous}\n\nImplement password reset flow." }
+]}}
+```
+
+Each step runs a separate subagent process. The pipeline stops on the first error. Per-step and total usage (tokens, cost, duration) are shown in the TUI.
+
+### Loop — Iterative Refinement
+
+Run the same agent 2–5 times, passing all prior iteration outputs as context. Optionally use a `judge` agent to stop early when quality is sufficient.
+
+**Basic (fixed iterations):**
+
+```json
+{ "tool": "loop", "args": {
+  "agent": "worker",
+  "task": "Write a comprehensive README for this project.",
+  "max_iterations": 3
+}}
+```
+
+**With judge for dynamic stopping:**
+
+```json
+{ "tool": "loop", "args": {
+  "agent": "worker",
+  "task": "Write a comprehensive README for this project.",
+  "max_iterations": 5,
+  "judge": {
+    "agent": "reviewer",
+    "criteria": "Is this README complete, well-structured, and ready for publication? Answer YES or NO."
+  }
+}}
+```
+
+The judge evaluates each iteration's output. When satisfied (YES), the loop stops early — no wasted iterations. Judge feedback is passed back to the runner agent for refinement.
 
 ## Config
 
@@ -80,6 +125,14 @@ Frontmatter fields:
 - **subagent_agents** — if `subagent` is in `tools`, restrict which agents this one may spawn. Comma-separated list of agent names. Omit for no restriction. Enforced by passing `PI_SUBAGENT_ALLOWED` env to the child `pi` process — the child's subagents extension filters its registry before any tool description sees it, so the child LLM literally can't reference an agent outside the allowlist.
 
 The markdown body becomes the agent's system prompt.
+
+Agents can optionally declare a `connector` field in their frontmatter — a prompt template that wraps their output before it's passed as `{previous}` to the next agent in a pipeline:
+
+```yaml
+connector: "## Key findings from codebase exploration:\n\n{output}"
+```
+
+Connectors use single-line format with `\n` for line breaks. They can be overridden per-step via the optional `connector` field on pipeline steps.
 
 ### 2. Register agents via `globalThis.__pi_subagents`
 
@@ -190,3 +243,7 @@ Matching is case-insensitive.
 └── tools/             # Extensions loaded into subagent processes
     └── safe-bash.ts   # bash with dangerous command blocking
 ```
+
+## Acknowledgements
+
+The pipeline and loop tools are conceptually inspired by [RecursiveMAS](https://arxiv.org/abs/2604.25917) — a research framework for scaling agent collaboration through iterative refinement and system-level orchestration. See [research/RECURSIVEMAS-RESEARCH.md](research/RECURSIVEMAS-RESEARCH.md) for details on what concepts were borrowed and adapted.
