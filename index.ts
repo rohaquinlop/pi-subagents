@@ -14,8 +14,9 @@ import { Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works
 import { Type } from "@sinclair/typebox";
 import "./tools/safe-bash";
 
-import type { AgentConfig, AgentUsage } from "./lib/types";
-import { discoverAgents, mergeAgents } from "./lib/helpers";
+import type { AgentConfig, AgentUsage, PipelineStepResult, PipelineResult, LoopIterationResult, LoopResult } from "./lib/types";
+import { discoverAgents, mergeAgents, substitutePlaceholders, formatConnectorContext } from "./lib/helpers";
+import { zeroUsage, accumulateUsage, validateAgents, MAX_LOOP_CONTEXT, parseJudgeVerdict } from "./lib/pipeline-helpers";
 
 interface ToolEvent {
 	tool: string;
@@ -68,7 +69,9 @@ interface AgentResult {
 }
 
 interface Details {
-	results: AgentResult[];
+	results?: AgentResult[];
+	pipelineResult?: PipelineResult & { currentStep?: number };
+	loopResult?: LoopResult & { currentIteration?: number };
 }
 
 // ── Config ─────────────────────────────────────────────────────────────
@@ -899,6 +902,339 @@ function renderAgentProgress(
 	return c;
 }
 
+// ── Pipeline Execution ────────────────────────────────────────────────
+
+async function runPipeline(
+	steps: Array<{ agent: string; task: string; connector?: string }>,
+	cwd: string,
+	signal: AbortSignal | undefined,
+	onUpdate?: (stepIndex: number, progress: AgentProgress, usage: AgentUsage) => void,
+): Promise<PipelineResult> {
+	const results: PipelineStepResult[] = [];
+	let previousOutput = "";
+	let totalUsage = zeroUsage();
+	const startTime = Date.now();
+
+	for (let i = 0; i < steps.length; i++) {
+		if (signal?.aborted) break;
+
+		const step = steps[i];
+		const agent = agents.find((a) => a.name === step.agent);
+		if (!agent) {
+			const errMsg = `Unknown agent: ${step.agent}`;
+			results.push({
+				agent: step.agent, task: step.task, output: `Error: ${errMsg}`,
+				exitCode: 1, usage: zeroUsage(), durationMs: 0,
+			});
+			return {
+				steps: results, finalOutput: previousOutput || "(no output)",
+				stoppedAt: i, error: errMsg,
+				totalUsage, totalDurationMs: Date.now() - startTime,
+			};
+		}
+
+		// Build task with {previous} substitution
+		let taskWithContext = step.task;
+		if (previousOutput && taskWithContext.includes("{previous}")) {
+			// Apply connector formatting if available (step-level overrides agent-level)
+			const connector = step.connector ?? agent.connector;
+			const formattedOutput = formatConnectorContext(previousOutput, connector);
+			taskWithContext = substitutePlaceholders(step.task, formattedOutput);
+		}
+
+		const stepStart = Date.now();
+		const result = await semaphore.run(() =>
+			runSubagent(agent, taskWithContext, cwd, signal, (progress, usage) => {
+				onUpdate?.(i, progress, usage);
+			}),
+		);
+
+		const stepResult: PipelineStepResult = {
+			agent: step.agent, task: step.task, output: result.output,
+			exitCode: result.exitCode, usage: result.usage,
+			durationMs: Date.now() - stepStart,
+		};
+		results.push(stepResult);
+		totalUsage = accumulateUsage(totalUsage, result.usage);
+		previousOutput = result.output;
+
+		// Stop on error
+		if (result.exitCode !== 0 || result.progress.error) {
+			return {
+				steps: results, finalOutput: previousOutput,
+				stoppedAt: i, error: result.progress.error || `Agent ${step.agent} exited with code ${result.exitCode}`,
+				totalUsage, totalDurationMs: Date.now() - startTime,
+			};
+		}
+	}
+
+	return {
+		steps: results, finalOutput: previousOutput || "(no output)",
+		totalUsage, totalDurationMs: Date.now() - startTime,
+	};
+}
+
+// ── Loop Execution ─────────────────────────────────────────────────────
+
+async function runLoop(
+	agentName: string,
+	task: string,
+	maxIterations: number,
+	judge: { agent: string; criteria: string } | undefined,
+	cwd: string,
+	signal: AbortSignal | undefined,
+	onUpdate?: (iteration: number, progress: AgentProgress, usage: AgentUsage) => void,
+): Promise<LoopResult> {
+	const agent = agents.find((a) => a.name === agentName);
+	if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+
+	const iterations: LoopIterationResult[] = [];
+	let priorOutputs: string[] = [];
+	let stoppedBecause: LoopResult["stoppedBecause"] = "max_iterations";
+	let totalUsage = zeroUsage();
+	const startTime = Date.now();
+
+	for (let i = 0; i < maxIterations; i++) {
+		if (signal?.aborted) break;
+
+		// Build task with accumulated context
+		let fullTask = task;
+		if (priorOutputs.length > 0) {
+			// Enforce MAX_LOOP_CONTEXT budget: drop oldest iterations first
+			let totalContext = 0;
+			let keptOutputs: string[] = [];
+			for (let j = priorOutputs.length - 1; j >= 0; j--) {
+				const block = `--- Iteration ${j + 1} output ---\n${priorOutputs[j]}`;
+				if (totalContext + block.length <= MAX_LOOP_CONTEXT) {
+					keptOutputs.unshift(block);
+					totalContext += block.length;
+				} else {
+					break;
+				}
+			}
+			const contextBlock = keptOutputs.join("\n\n");
+			fullTask = `${task}\n\n## Prior iterations:\n${contextBlock}`;
+		}
+
+		const iterStart = Date.now();
+		const result = await semaphore.run(() =>
+			runSubagent(agent, fullTask, cwd, signal, (progress, usage) => {
+				onUpdate?.(i, progress, usage);
+			}),
+		);
+
+		const iterResult: LoopIterationResult = {
+			iteration: i + 1, output: result.output,
+			exitCode: result.exitCode, usage: result.usage,
+			durationMs: Date.now() - iterStart,
+		};
+
+		// Judge evaluation (if configured)
+		if (judge && result.exitCode === 0 && !result.progress.error) {
+			const judgeAgent = agents.find((a) => a.name === judge.agent);
+			if (judgeAgent) {
+				const judgePrompt = `Evaluate this output against the criteria below. Respond with YES if satisfied, or NO with specific feedback.\n\nCriteria: ${judge.criteria}\n\nOutput to evaluate:\n${result.output}`;
+				const judgeResult = await semaphore.run(() =>
+					runSubagent(judgeAgent, judgePrompt, cwd, signal),
+				);
+				totalUsage = accumulateUsage(totalUsage, judgeResult.usage);
+
+				// Parse judge verdict
+				const satisfied = parseJudgeVerdict(judgeResult.output);
+
+				iterResult.judgeVerdict = { satisfied, response: judgeResult.output };
+
+				if (satisfied) {
+					iterations.push(iterResult);
+					stoppedBecause = "judge_satisfied";
+					return {
+						iterations, finalOutput: result.output,
+						stoppedBecause, totalUsage, totalDurationMs: Date.now() - startTime,
+					};
+				}
+			}
+		}
+
+		iterations.push(iterResult);
+		totalUsage = accumulateUsage(totalUsage, result.usage);
+		priorOutputs.push(result.output);
+
+		if (result.exitCode !== 0 || result.progress.error) {
+			stoppedBecause = "error";
+			return {
+				iterations, finalOutput: result.output || "(error)",
+				stoppedBecause, totalUsage, totalDurationMs: Date.now() - startTime,
+			};
+		}
+	}
+
+	return {
+		iterations, finalOutput: priorOutputs[priorOutputs.length - 1] || "(no output)",
+		stoppedBecause: "max_iterations",
+		totalUsage, totalDurationMs: Date.now() - startTime,
+	};
+}
+
+// ── Pipeline / Loop Rendering ─────────────────────────────────────────
+
+function renderPipelineResult(
+	result: PipelineResult,
+	theme: Theme,
+	expanded: boolean,
+	w: number,
+): Container {
+	const c = new Container();
+
+	// Header
+	c.addChild(new Text(
+		`${theme.fg("toolTitle", theme.bold("pipeline"))} — ${result.steps.length} steps · ${formatDuration(result.totalDurationMs)}`,
+		0, 0,
+	));
+	c.addChild(new Spacer(1));
+
+	// Steps
+	for (let i = 0; i < result.steps.length; i++) {
+		const step = result.steps[i];
+		const icon = step.exitCode === 0
+			? theme.fg("success", "✓")
+			: theme.fg("error", "✗");
+
+		if (!expanded) {
+			const arrow = i < result.steps.length - 1 && result.steps[i].exitCode === 0 && result.stoppedAt === undefined
+				? theme.fg("dim", " → ")
+				: "";
+			c.addChild(new Text(
+				`  ${icon} ${theme.fg("accent", step.agent)}${arrow}`,
+				0, 0,
+			));
+		} else {
+			c.addChild(new Text(
+				`  ${icon} ${theme.fg("accent", step.agent)} — ${formatDuration(step.durationMs)}`,
+				0, 0,
+			));
+			c.addChild(new Text(
+				`    ${theme.fg("dim", "Task:")} ${truncLine(step.task, w - 20)}`,
+				0, 0,
+			));
+			if (step.output) {
+				c.addChild(new Spacer(1));
+				const mdTheme = getMarkdownTheme();
+				c.addChild(new Markdown(step.output, 2, 0, mdTheme));
+			}
+			if (i < result.steps.length - 1 && result.stoppedAt === undefined) {
+				c.addChild(new Text(theme.fg("dim", "  ↓"), 0, 0));
+			}
+		}
+	}
+
+	// Show running indicator if pipeline is still executing
+	if (result.currentStep !== undefined && result.currentStep >= result.steps.length) {
+		if (!expanded) {
+			const hasCompletedSteps = result.steps.length > 0;
+			const lastCompletedOk = hasCompletedSteps && result.steps[result.steps.length - 1].exitCode === 0;
+			const arrow = hasCompletedSteps && lastCompletedOk ? theme.fg("dim", " → ") : "";
+			c.addChild(new Text(
+				`  ${arrow}${theme.fg("warning", "⟳")} ${theme.fg("dim", "running...")}`,
+				0, 0,
+			));
+		}
+	}
+
+	// Error message if pipeline failed
+	if (result.error) {
+		c.addChild(new Spacer(1));
+		c.addChild(new Text(theme.fg("error", `Stopped at step ${(result.stoppedAt ?? 0) + 1}: ${result.error}`), 0, 0));
+	}
+
+	// Usage summary
+	c.addChild(new Spacer(1));
+	const usageParts: string[] = [];
+	if (result.totalUsage.input) usageParts.push(theme.fg("dim", `↑${formatTokens(result.totalUsage.input)}`));
+	if (result.totalUsage.output) usageParts.push(theme.fg("dim", `↓${formatTokens(result.totalUsage.output)}`));
+	if (result.totalUsage.cost) usageParts.push(theme.fg("dim", `$${result.totalUsage.cost.toFixed(3)}`));
+	if (usageParts.length) c.addChild(new Text(usageParts.join(" "), 0, 0));
+
+	return c;
+}
+
+function renderLoopResult(
+	result: LoopResult,
+	theme: Theme,
+	expanded: boolean,
+	w: number,
+): Container {
+	const c = new Container();
+
+	const stoppedLabel = result.stoppedBecause === "judge_satisfied"
+		? theme.fg("success", "judge satisfied")
+		: result.stoppedBecause === "error"
+			? theme.fg("error", "stopped (error)")
+			: theme.fg("dim", `max ${result.iterations.length} iterations`);
+
+	// Header
+	c.addChild(new Text(
+		`${theme.fg("toolTitle", theme.bold("loop"))} — ${result.iterations.length} iterations · ${stoppedLabel} · ${formatDuration(result.totalDurationMs)}`,
+		0, 0,
+	));
+	c.addChild(new Spacer(1));
+
+	// Iterations
+	result.iterations.forEach((iter, idx) => {
+		const icon = iter.exitCode === 0
+			? theme.fg("success", "✓")
+			: theme.fg("error", "✗");
+
+		const verdictStr = iter.judgeVerdict
+			? (iter.judgeVerdict.satisfied
+				? theme.fg("success", " (YES)")
+				: theme.fg("warning", " (NO)"))
+			: "";
+
+		if (!expanded) {
+			const isLast = idx === result.iterations.length - 1;
+			const arrow = isLast ? "" : theme.fg("dim", " → ");
+			c.addChild(new Text(
+				`  ${icon} ${theme.fg("accent", `Iteration ${iter.iteration}`)}${verdictStr}${arrow}`,
+				0, 0,
+			));
+		} else {
+			c.addChild(new Text(
+				`  ${icon} ${theme.fg("accent", `Iteration ${iter.iteration}`)}${verdictStr} — ${formatDuration(iter.durationMs)}`,
+				0, 0,
+			));
+			if (iter.output) {
+				const mdTheme = getMarkdownTheme();
+				c.addChild(new Markdown(iter.output, 2, 0, mdTheme));
+			}
+			if (iter.judgeVerdict && !iter.judgeVerdict.satisfied) {
+				c.addChild(new Text(theme.fg("dim", "  ↓ refine"), 0, 0));
+			}
+		}
+	});
+
+	// Show running indicator if loop is still executing
+	if (result.currentIteration !== undefined && result.currentIteration >= result.iterations.length) {
+		if (!expanded) {
+			const hasCompleted = result.iterations.length > 0;
+			const arrow = hasCompleted ? theme.fg("dim", " → ") : "";
+			c.addChild(new Text(
+				`  ${arrow}${theme.fg("warning", "⟳")} ${theme.fg("dim", "refining...")}`,
+				0, 0,
+			));
+		}
+	}
+
+	// Usage summary
+	c.addChild(new Spacer(1));
+	const usageParts: string[] = [];
+	if (result.totalUsage.input) usageParts.push(theme.fg("dim", `↑${formatTokens(result.totalUsage.input)}`));
+	if (result.totalUsage.output) usageParts.push(theme.fg("dim", `↓${formatTokens(result.totalUsage.output)}`));
+	if (result.totalUsage.cost) usageParts.push(theme.fg("dim", `$${result.totalUsage.cost.toFixed(3)}`));
+	if (usageParts.length) c.addChild(new Text(usageParts.join(" "), 0, 0));
+
+	return c;
+}
+
 // ── Extension ─────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -1022,7 +1358,7 @@ export default function (pi: ExtensionAPI) {
 		// ── Render: result ──
 		renderResult(result, options, theme, context) {
 			const details = result.details as Details | undefined;
-			if (!details?.results?.length) {
+			if (!details) {
 				const t = result.content[0];
 				const text = t?.type === "text" ? t.text : "(no output)";
 				return new Text(text.slice(0, 200), 0, 0);
@@ -1030,8 +1366,262 @@ export default function (pi: ExtensionAPI) {
 
 			const w = getTermWidth() - 4;
 			const expanded = options.expanded;
-			const c = new Container();
-			c.addChild(renderAgentProgress(details.results[0], theme, expanded, w));
+
+			// Pipeline result
+			if (details.pipelineResult) {
+				return renderPipelineResult(details.pipelineResult, theme, expanded, w);
+			}
+
+			// Loop result
+			if (details.loopResult) {
+				return renderLoopResult(details.loopResult, theme, expanded, w);
+			}
+
+			// Single agent result (existing behavior)
+			if (details.results?.length) {
+				const c = new Container();
+				c.addChild(renderAgentProgress(details.results[0], theme, expanded, w));
+				return c;
+			}
+
+			// Fallback
+			const t = result.content[0];
+			const text = t?.type === "text" ? t.text : "(no output)";
+			return new Text(text.slice(0, 200), 0, 0);
+		},
+	});
+
+	// ── Pipeline Tool ────────────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "pipeline",
+		label: "Pipeline",
+		description:
+			"Run 2–5 agents in sequence. Each agent's output feeds as {previous} context into the next agent's task. Use for multi-stage workflows like scout → planner → worker.",
+		promptSnippet: "Run sequential multi-agent pipelines",
+		promptGuidelines: [
+			"Use pipeline when a task naturally decomposes into sequential agent roles (e.g. explore → plan → implement → review).",
+			"Each step receives the previous step's output automatically via {previous} placeholder substitution.",
+			"Pipelines stop on first error. The finalOutput is the last successful step's output.",
+		],
+		parameters: Type.Object({
+			steps: Type.Array(
+				Type.Object({
+					agent: Type.String({ description: "Agent name for this step" }),
+					task: Type.String({ description: "Task description. Use {previous} to reference the prior step's output." }),
+					connector: Type.Optional(Type.String({ description: "Override agent's default connector template for this step. Format: \"## Header\\n\\n{output}\"" })),
+				}),
+				{ minItems: 2, maxItems: 5, description: "Sequential steps (2–5). Each step's agent output feeds into the next step's task via {previous}." },
+			),
+			cwd: Type.Optional(Type.String({ description: "Working directory for all agent processes" })),
+		}),
+
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const cwd = params.cwd ?? ctx.cwd;
+
+			if (!params.steps || params.steps.length < 2) {
+				throw new Error("pipeline requires at least 2 steps");
+			}
+
+			// Validate all agents exist
+			const agentNames = params.steps.map((s: { agent: string }) => s.agent);
+			const missing = validateAgents(agentNames, agents);
+			if (missing) {
+				const available = agents.map((a) => a.name).join(", ") || "none";
+				throw new Error(`Unknown agent in pipeline: ${missing}. Available agents: ${available}`);
+			}
+
+			const liveResult: Details = {
+				pipelineResult: {
+					steps: [],
+					currentStep: 0,
+					finalOutput: "",
+					totalUsage: zeroUsage(),
+					totalDurationMs: 0,
+				},
+			};
+
+			const result = await runPipeline(
+				params.steps,
+				cwd,
+				signal,
+				(stepIndex, progress, usage) => {
+					const pResult = liveResult.pipelineResult!;
+					pResult.currentStep = stepIndex;
+					// Update live result with latest step progress
+					if (progress.status === "running") {
+						// Ensure step slot exists for live rendering
+						if (stepIndex === pResult.steps.length) {
+							pResult.steps.push({
+								agent: params.steps[stepIndex].agent,
+								task: params.steps[stepIndex].task,
+								output: "",
+								exitCode: -1, // sentinel: not yet done
+								usage,
+								durationMs: progress.durationMs,
+							});
+						}
+					}
+					if (progress.status === "completed" || progress.status === "failed") {
+						const stepResult: PipelineStepResult = {
+							agent: params.steps[stepIndex].agent,
+							task: params.steps[stepIndex].task,
+							output: progress.lastMessage || "",
+							exitCode: progress.status === "failed" ? 1 : 0,
+							usage,
+							durationMs: progress.durationMs,
+						};
+						// Replace placeholder or push
+						while (pResult.steps.length <= stepIndex) {
+							pResult.steps.push({...stepResult, output: "", exitCode: -1, usage: zeroUsage()});
+						}
+						pResult.steps[stepIndex] = stepResult;
+					}
+				onUpdate?.({
+					content: [{ type: "text", text: `Pipeline: step ${stepIndex + 1}/${params.steps.length}` }],
+					details: liveResult,
+				});
+			},
+		);
+
+			const isError = result.stoppedAt !== undefined;
+			return {
+				content: [{ type: "text", text: result.finalOutput || "(no output)" }],
+				details: { pipelineResult: result },
+				...(isError ? { isError: true } : {}),
+			};
+		},
+
+		renderCall(args, theme, context) {
+			if (!context.expanded) {
+				if (!args.steps) {
+					return new Text(theme.fg("toolTitle", theme.bold("pipeline")), 0, 0);
+				}
+				const stepNames = args.steps.map((s: { agent?: string }) => s?.agent || "?").join(" → ");
+				return new Text(
+					`${theme.fg("toolTitle", theme.bold("pipeline"))} ${theme.fg("accent", stepNames)}`,
+					0, 0,
+				);
+			}
+
+			const c = context.lastComponent instanceof Container
+				? (context.lastComponent.clear(), context.lastComponent)
+				: new Container();
+			const stepCount = args.steps?.length || 0;
+			c.addChild(new Text(`${theme.fg("toolTitle", theme.bold("pipeline"))} — ${stepCount} steps`, 0, 0));
+			if (args.steps) {
+				c.addChild(new Spacer(1));
+				for (let i = 0; i < args.steps.length; i++) {
+					const step = args.steps[i];
+					const agentLabel = step.agent ? theme.fg("accent", step.agent) : "?";
+					const taskPreview = step.task ? truncLine(step.task, 60) : "";
+					c.addChild(new Text(`  ${theme.fg("dim", `${i + 1}.`)} ${agentLabel} ${theme.fg("dim", taskPreview)}`, 0, 0));
+				}
+			}
+			return c;
+		},
+	});
+
+	// ── Loop Tool ─────────────────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "loop",
+		label: "Loop",
+		description:
+			"Run the same agent 2–5 times, passing prior iteration outputs as context. Optionally use a judge agent to evaluate quality and stop early.",
+		promptSnippet: "Run iterative refinement loops with optional judge",
+		promptGuidelines: [
+			"Use loop for tasks that benefit from iterative refinement (e.g. drafting → reviewing → polishing).",
+			"Configure a judge agent to stop early when quality is sufficient, avoiding wasted iterations.",
+			"Each iteration receives all prior outputs as context, enabling progressive improvement.",
+		],
+		parameters: Type.Object({
+			agent: Type.String({ description: "Agent name to run in the loop" }),
+			task: Type.String({ description: "Task description for each iteration" }),
+			max_iterations: Type.Optional(Type.Number({ minimum: 2, maximum: 5, default: 3, description: "Maximum number of iterations (2–5, default 3)" })),
+			judge: Type.Optional(Type.Object({
+				agent: Type.String({ description: "Judge agent name" }),
+				criteria: Type.String({ description: "Quality criteria. Judge responds YES if satisfied, NO otherwise." }),
+			}, { description: "Optional judge agent to evaluate each iteration and stop early when quality is sufficient" })),
+			cwd: Type.Optional(Type.String({ description: "Working directory for agent processes" })),
+		}),
+
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const cwd = params.cwd ?? ctx.cwd;
+			const maxIterations = params.max_iterations ?? 3;
+
+			// Validate agent exists
+			const agentNames = [params.agent];
+			if (params.judge) agentNames.push(params.judge.agent);
+			const missing = validateAgents(agentNames, agents);
+			if (missing) {
+				const available = agents.map((a) => a.name).join(", ") || "none";
+				throw new Error(`Unknown agent in loop: ${missing}. Available agents: ${available}`);
+			}
+
+			const liveResult: Details = {
+				loopResult: {
+					iterations: [],
+					currentIteration: 0,
+					finalOutput: "",
+					stoppedBecause: "max_iterations",
+					totalUsage: zeroUsage(),
+					totalDurationMs: 0,
+				},
+			};
+
+			const result = await runLoop(
+				params.agent,
+				params.task,
+				maxIterations,
+				params.judge,
+				cwd,
+				signal,
+				(iteration, progress, usage) => {
+					const lResult = liveResult.loopResult!;
+					lResult.currentIteration = iteration;
+					onUpdate?.({
+						content: [{ type: "text", text: `Loop: iteration ${iteration + 1}/${maxIterations}` }],
+						details: liveResult,
+					});
+				},
+			);
+
+			const isError = result.stoppedBecause === "error";
+			return {
+				content: [{ type: "text", text: result.finalOutput || "(no output)" }],
+				details: { loopResult: result },
+				...(isError ? { isError: true } : {}),
+			};
+		},
+
+		renderCall(args, theme, context) {
+			if (!context.expanded) {
+				if (!args.agent) {
+					return new Text(theme.fg("toolTitle", theme.bold("loop")), 0, 0);
+				}
+				const maxIter = args.max_iterations || 3;
+				const judgeStr = args.judge ? ` (judge: ${theme.fg("accent", (args.judge as { agent?: string }).agent || "?")})` : "";
+				return new Text(
+					`${theme.fg("toolTitle", theme.bold("loop"))} ${theme.fg("accent", args.agent)} × ${maxIter}${judgeStr}`,
+					0, 0,
+				);
+			}
+
+			const c = context.lastComponent instanceof Container
+				? (context.lastComponent.clear(), context.lastComponent)
+				: new Container();
+			const maxIter = args.max_iterations || 3;
+			c.addChild(new Text(`${theme.fg("toolTitle", theme.bold("loop"))} ${theme.fg("accent", args.agent || "?")} × ${maxIter}`, 0, 0));
+			if (args.task) {
+				c.addChild(new Spacer(1));
+				c.addChild(new Text(theme.fg("text", args.task), 0, 0));
+			}
+			if (args.judge) {
+				const j = args.judge as { agent?: string; criteria?: string };
+				c.addChild(new Spacer(1));
+				c.addChild(new Text(`${theme.fg("dim", "Judge:")} ${theme.fg("accent", j.agent || "?")} — ${theme.fg("dim", j.criteria || "")}`, 0, 0));
+			}
 			return c;
 		},
 	});

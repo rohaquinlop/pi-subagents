@@ -40,3 +40,14 @@ export function validateAgents(
  * When exceeded, oldest iterations are dropped first, keeping only the last 2–3.
  */
 export const MAX_LOOP_CONTEXT = 48000;
+
+/**
+ * Parse a judge agent's response to determine if it signals satisfaction.
+ * Extracts the first non-empty line, strips markdown formatting, and checks
+ * for word-boundary YES match. Returns false on any parse failure.
+ */
+export function parseJudgeVerdict(response: string): boolean {
+    const firstLine = response.split('\n').find(l => l.trim()) || '';
+    const cleaned = firstLine.replace(/[*_`#]/g, '').trim().toUpperCase();
+    return /\bYES\b/.test(cleaned);
+}
