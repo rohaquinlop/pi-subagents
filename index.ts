@@ -1028,6 +1028,7 @@ async function runLoop(
 			exitCode: result.exitCode, usage: result.usage,
 			durationMs: Date.now() - iterStart,
 		};
+		totalUsage = accumulateUsage(totalUsage, result.usage);
 
 		// Judge evaluation (if configured)
 		if (judge && result.exitCode === 0 && !result.progress.error) {
@@ -1056,7 +1057,6 @@ async function runLoop(
 		}
 
 		iterations.push(iterResult);
-		totalUsage = accumulateUsage(totalUsage, result.usage);
 		priorOutputs.push(result.output);
 
 		if (result.exitCode !== 0 || result.progress.error) {
