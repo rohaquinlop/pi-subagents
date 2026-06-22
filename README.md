@@ -246,4 +246,4 @@ Matching is case-insensitive.
 
 ## Acknowledgements
 
-The pipeline and loop tools are conceptually inspired by [RecursiveMAS](https://arxiv.org/abs/2604.25917) — a research framework for scaling agent collaboration through iterative refinement and system-level orchestration. See [research/RECURSIVEMAS-RESEARCH.md](research/RECURSIVEMAS-RESEARCH.md) for details on what concepts were borrowed and adapted.
+The pipeline and loop tools are conceptually inspired by [RecursiveMAS](https://arxiv.org/abs/2604.25917) — a research framework for scaling agent collaboration through iterative refinement and system-level orchestration.
