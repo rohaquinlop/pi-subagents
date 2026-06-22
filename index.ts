@@ -199,7 +199,7 @@ const MODEL_EXTENSIONS: ModelExtension[] = buildModelExtensions();
 // ── Agent Discovery & Registration ────────────────────────────────────
 
 let agents: AgentConfig[] = [];
-let semaphore = new Semaphore(DEFAULT_MAX_CONCURRENCY);
+let semaphore: Semaphore;
 
 // Read once at module load. If we're a child subagent process whose parent
 // pinned an allowlist, we silently ignore any agent (built-in OR registered
