@@ -1021,10 +1021,18 @@ async function runPipeline(
 		totalUsage = accumulateUsage(totalUsage, result.usage);
 		previousOutput = result.output;
 
-		// Stop on error
+		// Stop on error — surface the failing step's error as finalOutput (the pipeline
+		// tool returns finalOutput as content, so the main LLM sees the actual failure,
+		// not the previous step's success text).
 		if (result.exitCode !== 0 || result.progress.error) {
+			const errorDetail = [
+				`Pipeline failed at step ${i + 1} (agent: ${step.agent}).`,
+				`Exit code: ${result.exitCode}`,
+				result.progress.error ? `Error: ${result.progress.error}` : null,
+				result.output ? `Output:\n${result.output}` : "(no output)",
+			].filter(Boolean).join("\n");
 			return {
-				steps: results, finalOutput: previousOutput,
+				steps: results, finalOutput: errorDetail,
 				stoppedAt: i, error: result.progress.error || `Agent ${step.agent} exited with code ${result.exitCode}`,
 				totalUsage, totalDurationMs: Date.now() - startTime,
 			};
@@ -1469,7 +1477,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use pipeline when a task naturally decomposes into sequential agent roles (e.g. explore → plan → implement → review).",
 			"Each step receives the previous step's output automatically via {previous} placeholder substitution.",
-			"Pipelines stop on first error. The finalOutput is the last successful step's output.",
+			"Pipelines stop on first error. The finalOutput is the failing step's error detail.",
 			"When a pipeline fails at a step, the error identifies which step and why. Retry the failing step with a simpler task, or re-scope the pipeline. Early-step (exploration) failures → retry the whole pipeline with a more focused scope.",
 		],
 		parameters: Type.Object({
