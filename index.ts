@@ -56,6 +56,7 @@ interface AgentProgress {
 	durationMs: number;
 	lastMessage: string;
 	error?: string;
+	warning?: string;
 }
 
 interface AgentResult {
@@ -725,6 +726,9 @@ async function runSubagent(
 			if (buf.trim()) processLine(buf);
 			if (code !== 0 && stderrBuf.trim() && !progress.error) {
 				progress.error = stderrBuf.trim();
+			} else if (code === 0 && stderrBuf.trim()) {
+				// Non-fatal: surface stderr (e.g. deprecation warnings) on a successful exit.
+				progress.warning = stderrBuf.trim().slice(0, 2000);
 			}
 			safeResolve(code ?? 1);
 		});
@@ -967,6 +971,10 @@ function renderAgentProgress(
 	// Error
 	if (prog.error) {
 		addLine(theme.fg("error", `Error: ${prog.error}`));
+	}
+
+	if (prog.warning) {
+		addLine(theme.fg("warning", `Warning: ${prog.warning}`));
 	}
 
 	return c;
