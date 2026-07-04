@@ -18,6 +18,7 @@ import type { AgentConfig, AgentUsage, PipelineStepResult, PipelineResult, LoopI
 import { discoverAgents, mergeAgents, substitutePlaceholders, formatConnectorContext } from "./lib/helpers";
 import { zeroUsage, accumulateUsage, validateAgents, MAX_LOOP_CONTEXT, parseJudgeVerdict } from "./lib/pipeline-helpers";
 import { buildSubagentErrorContent, buildPipelineErrorContent, buildLoopErrorContent } from "./lib/error-helpers";
+import { detectCycle } from "./lib/loop-detector";
 
 interface ToolEvent {
 	tool: string;
@@ -558,6 +559,7 @@ async function runSubagent(
 		let inFlightToolCount = 0;
 		let childClosed = false;
 		let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
+		let callHistory: string[] = [];	// sliding window of tool-call signatures for cycle detection
 
 		const safeResolve = (code: number) => {
 			if (resolved) return;
@@ -625,6 +627,29 @@ async function runSubagent(
 						toolCallId: evt.toolCallId,
 						status: "running",
 					});
+					// ── Cycle detection (parent-side, context-free) ──
+					// Signature = toolName + args preview. Two calls with different args
+					// (different file, or same file different content) → different sig.
+					const sig = `${evt.toolName}:${extractToolArgsPreview((evt.args || {}) as Record<string, unknown>)}`;
+					const cycleResult = detectCycle(callHistory, sig);
+					callHistory.push(sig);
+					if (callHistory.length > 24) callHistory = callHistory.slice(-24);
+
+					if (cycleResult.cycle) {
+						const toolNames = (cycleResult.pattern || []).map((s) => {
+							const colonIdx = s.indexOf(":");
+							return colonIdx >= 0 ? s.slice(0, colonIdx) : s;
+						});
+						const patternStr = toolNames.join("→");
+						if (!progress.error) {
+							progress.error = `Subagent stuck in a tool-call loop: repeating ${patternStr}`;
+						}
+						proc.kill("SIGTERM");
+						clearTimeout(sigkillTimer);
+						sigkillTimer = setTimeout(() => {
+							if (!childClosed) proc.kill("SIGKILL");
+						}, 5000);
+					}
 					fireUpdate();
 				}
 
