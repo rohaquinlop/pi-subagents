@@ -1324,6 +1324,7 @@ export default function (pi: ExtensionAPI) {
 			"Use subagent to delegate *reasoning and decisions*: codebase exploration (scout), web research (researcher), or isolated code changes (worker)",
 			"For multiple independent subagent tasks, emit multiple `subagent` tool calls in the same turn — they run in parallel automatically.",
 			"Subagents have NO context from the current conversation — include ALL necessary context in the task description",
+			"When a subagent returns an error, read it carefully. For transient failures (timeout, API/network), retry once with the same task plus 'Previous attempt failed with: {error}'. For structural failures (wrong approach, missing context), simplify the task or switch agents. If it persists after retry, report to the user with the specific error.",
 		],
 		parameters: Type.Object({
 			agent: Type.String({ description: "Name of the agent to invoke" }),
@@ -1469,6 +1470,7 @@ export default function (pi: ExtensionAPI) {
 			"Use pipeline when a task naturally decomposes into sequential agent roles (e.g. explore → plan → implement → review).",
 			"Each step receives the previous step's output automatically via {previous} placeholder substitution.",
 			"Pipelines stop on first error. The finalOutput is the last successful step's output.",
+			"When a pipeline fails at a step, the error identifies which step and why. Retry the failing step with a simpler task, or re-scope the pipeline. Early-step (exploration) failures → retry the whole pipeline with a more focused scope.",
 		],
 		parameters: Type.Object({
 			steps: Type.Array(
@@ -1600,6 +1602,7 @@ export default function (pi: ExtensionAPI) {
 			"Use loop for tasks that benefit from iterative refinement (e.g. drafting → reviewing → polishing).",
 			"Configure a judge agent to stop early when quality is sufficient, avoiding wasted iterations.",
 			"Each iteration receives all prior outputs as context, enabling progressive improvement.",
+			"When a loop iteration fails, the error shows which iteration. Reduce max_iterations or simplify the task; if the judge consistently rejects, refine the criteria or switch judge agent.",
 		],
 		parameters: Type.Object({
 			agent: Type.String({ description: "Agent name to run in the loop" }),
