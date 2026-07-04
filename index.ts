@@ -17,6 +17,8 @@ import "./tools/safe-bash";
 import type { AgentConfig, AgentUsage, PipelineStepResult, PipelineResult, LoopIterationResult, LoopResult } from "./lib/types";
 import { discoverAgents, mergeAgents, substitutePlaceholders, formatConnectorContext } from "./lib/helpers";
 import { zeroUsage, accumulateUsage, validateAgents, MAX_LOOP_CONTEXT, parseJudgeVerdict } from "./lib/pipeline-helpers";
+import { buildSubagentErrorContent, buildPipelineErrorContent, buildLoopErrorContent } from "./lib/error-helpers";
+import { detectCycle } from "./lib/loop-detector";
 
 interface ToolEvent {
 	tool: string;
@@ -55,6 +57,7 @@ interface AgentProgress {
 	durationMs: number;
 	lastMessage: string;
 	error?: string;
+	warning?: string;
 }
 
 interface AgentResult {
@@ -78,6 +81,8 @@ interface Details {
 
 interface ExtensionConfig {
 	maxConcurrency?: number;
+	subagentTimeoutMs?: number;      // wall-clock, default 600000 (10 min). 0 = disabled.
+	subagentIdleTimeoutMs?: number;  // no-stdout watchdog, default 300000 (5 min). 0 = disabled.
 }
 
 const EXT_DIR = path.dirname(new URL(import.meta.url).pathname);
@@ -85,6 +90,10 @@ const AGENTS_DIR = path.join(EXT_DIR, "agents");
 const TOOLS_DIR = path.join(EXT_DIR, "tools");
 const CONFIG_PATH = path.join(EXT_DIR, "config.json");
 const DEFAULT_MAX_CONCURRENCY = 4;
+const DEFAULT_SUBAGENT_TIMEOUT_MS = 600_000;     // 10 minutes
+const DEFAULT_SUBAGENT_IDLE_TIMEOUT_MS = 300_000; // 5 minutes
+
+let extensionConfig: ExtensionConfig = {};
 
 function loadConfig(): ExtensionConfig {
 	try {
@@ -479,6 +488,11 @@ function flatten(s: string): string {
 // doesn't need to read inline anyway.
 const MAX_ARG_PREVIEW = 4000;
 
+// Hard cap on recentTools entries to prevent unbounded memory growth in
+// long-running subagents. Generous for expanded-view history; matches the
+// callHistory trim pattern.
+const MAX_RECENT_TOOLS = 50;
+
 function extractToolArgsPreview(args: Record<string, unknown>): string {
 	const cap = (s: string) => (s.length > MAX_ARG_PREVIEW ? s.slice(0, MAX_ARG_PREVIEW) + "…" : s);
 	if (args.command) return cap(flatten(String(args.command)));
@@ -502,7 +516,7 @@ async function runSubagent(
 	task: string,
 	cwd: string,
 	signal: AbortSignal | undefined,
-	onUpdate?: (progress: AgentProgress, usage: AgentResult["usage"]) => void,
+	onUpdate?: (progress: AgentProgress, usage: AgentResult["usage"], finalExitCode?: number) => void,
 ): Promise<AgentResult> {
 	const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd);
 	const command = args[0];
@@ -544,14 +558,73 @@ async function runSubagent(
 
 		let buf = "";
 		let stderrBuf = "";
+		let resolved = false;
+		let wallTimer: ReturnType<typeof setTimeout> | undefined;
+		let idleTimer: ReturnType<typeof setTimeout> | undefined;
+		let inFlightToolCount = 0;
+		let childClosed = false;
+		let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
+		let callHistory: string[] = [];	// sliding window of tool-call signatures for cycle detection
+
+		const safeResolve = (code: number) => {
+			if (resolved) return;
+			resolved = true;
+			clearTimeout(wallTimer);
+			clearTimeout(idleTimer);
+			clearTimeout(sigkillTimer);
+			if (signal) signal.removeEventListener("abort", abortKill);
+			resolve(code);
+		};
+
+		// Wall-clock timeout
+		const timeoutMs = extensionConfig.subagentTimeoutMs ?? DEFAULT_SUBAGENT_TIMEOUT_MS;
+		if (timeoutMs > 0) {
+			wallTimer = setTimeout(() => {
+				if (!progress.error) progress.error = `Subagent timed out after ${Math.round(timeoutMs / 1000)}s`;
+				proc.kill("SIGTERM");
+				clearTimeout(sigkillTimer);
+				sigkillTimer = setTimeout(() => {
+					if (!childClosed) proc.kill("SIGKILL");
+				}, 5000);
+			}, timeoutMs);
+		}
+
+		// Idle (no-stdout) watchdog
+		const idleMs = extensionConfig.subagentIdleTimeoutMs ?? DEFAULT_SUBAGENT_IDLE_TIMEOUT_MS;
+		const resetIdle = () => {
+			if (idleMs <= 0) return;
+			clearTimeout(idleTimer);
+			idleTimer = setTimeout(() => {
+				if (!progress.error) progress.error = `Subagent idle for ${Math.round(idleMs / 1000)}s — likely stuck`;
+				proc.kill("SIGTERM");
+				clearTimeout(sigkillTimer);
+				sigkillTimer = setTimeout(() => {
+					if (!childClosed) proc.kill("SIGKILL");
+				}, 5000);
+			}, idleMs);
+		};
+		resetIdle();
+
+		const pauseIdle = () => {
+			clearTimeout(idleTimer);
+			idleTimer = undefined;
+		};
+		const resumeIdle = () => {
+			if (inFlightToolCount === 0) resetIdle();
+		};
+
+		const MAX_STDERR_BYTES = 100_000;
 
 		const processLine = (line: string) => {
+			if (inFlightToolCount === 0) resetIdle();
 			if (!line.trim()) return;
 			try {
 				const evt = JSON.parse(line) as any;
 				progress.durationMs = Date.now() - startTime;
 
 				if (evt.type === "tool_execution_start") {
+					inFlightToolCount++;
+					pauseIdle();
 					progress.toolCount++;
 					progress.recentTools.push({
 						tool: evt.toolName,
@@ -559,6 +632,37 @@ async function runSubagent(
 						toolCallId: evt.toolCallId,
 						status: "running",
 					});
+					// Trim oldest completed entries, but never evict an in-flight tool —
+					// otherwise tool_execution_end's .find(toolCallId) would no-op and leave a
+					// permanently-"running" ghost.
+					while (progress.recentTools.length > MAX_RECENT_TOOLS) {
+						const idx = progress.recentTools.findIndex((t) => t.status !== "running");
+						if (idx === -1) break; // only running entries left — don't evict in-flight
+						progress.recentTools.splice(idx, 1);
+					}
+					// ── Cycle detection (parent-side, context-free) ──
+					// Signature = toolName + args preview. Two calls with different args
+					// (different file, or same file different content) → different sig.
+					const sig = `${evt.toolName}:${extractToolArgsPreview((evt.args || {}) as Record<string, unknown>)}`;
+					const cycleResult = detectCycle(callHistory, sig);
+					callHistory.push(sig);
+					if (callHistory.length > 24) callHistory = callHistory.slice(-24);
+
+					if (cycleResult.cycle) {
+						const toolNames = (cycleResult.pattern || []).map((s) => {
+							const colonIdx = s.indexOf(":");
+							return colonIdx >= 0 ? s.slice(0, colonIdx) : s;
+						});
+						const patternStr = toolNames.join("→");
+						if (!progress.error) {
+							progress.error = `Subagent stuck in a tool-call loop: repeating ${patternStr}`;
+						}
+						proc.kill("SIGTERM");
+						clearTimeout(sigkillTimer);
+						sigkillTimer = setTimeout(() => {
+							if (!childClosed) proc.kill("SIGKILL");
+						}, 5000);
+					}
 					fireUpdate();
 				}
 
@@ -593,6 +697,8 @@ async function runSubagent(
 							hit.children = finalChildren as AgentResult[];
 						}
 					}
+					inFlightToolCount = Math.max(0, inFlightToolCount - 1);
+					resumeIdle();
 					fireUpdate();
 				}
 
@@ -659,26 +765,37 @@ async function runSubagent(
 		});
 
 		proc.stderr.on("data", (d: Buffer) => {
+			if (stderrBuf.length >= MAX_STDERR_BYTES) return;
 			stderrBuf += d.toString();
+			if (stderrBuf.length >= MAX_STDERR_BYTES) {
+				stderrBuf = stderrBuf.slice(0, MAX_STDERR_BYTES) + "\n[stderr truncated]";
+			}
 		});
 
 		proc.on("close", (code) => {
+			childClosed = true;
 			if (buf.trim()) processLine(buf);
 			if (code !== 0 && stderrBuf.trim() && !progress.error) {
 				progress.error = stderrBuf.trim();
+			} else if (code === 0 && stderrBuf.trim()) {
+				// Non-fatal: surface stderr (e.g. deprecation warnings) on a successful exit.
+				progress.warning = stderrBuf.trim().slice(0, 2000);
 			}
-			resolve(code ?? 1);
+			safeResolve(code ?? 1);
 		});
 
-		proc.on("error", () => resolve(1));
+		proc.on("error", () => safeResolve(1));
 
+		const abortKill = () => {
+			proc.kill("SIGTERM");
+			clearTimeout(sigkillTimer);
+			sigkillTimer = setTimeout(() => {
+				if (!childClosed) proc.kill("SIGKILL");
+			}, 3000);
+		};
 		if (signal) {
-			const kill = () => {
-				proc.kill("SIGTERM");
-				setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
-			};
-			if (signal.aborted) kill();
-			else signal.addEventListener("abort", kill, { once: true });
+			if (signal.aborted) abortKill();
+			else signal.addEventListener("abort", abortKill, { once: true });
 		}
 	});
 
@@ -690,6 +807,13 @@ async function runSubagent(
 	result.exitCode = exitCode;
 	progress.status = exitCode === 0 && !progress.error ? "completed" : "failed";
 	progress.durationMs = Date.now() - startTime;
+
+	// Push the terminal status to the live renderer so the TUI doesn't keep
+	// showing "running" after the child has exited. Pass exitCode so callers
+	// that hold a live result object (the subagent tool) can sync its exitCode
+	// and render the correct ✓/✗ icon instead of the -1 placeholder.
+	onUpdate?.(progress, result.usage, exitCode);
+
 	if (progress.error) result.output = result.output || `Error: ${progress.error}`;
 
 	// Truncate output if very large
@@ -900,6 +1024,10 @@ function renderAgentProgress(
 		addLine(theme.fg("error", `Error: ${prog.error}`));
 	}
 
+	if (prog.warning) {
+		addLine(theme.fg("warning", `Warning: ${prog.warning}`));
+	}
+
 	return c;
 }
 
@@ -959,10 +1087,13 @@ async function runPipeline(
 		totalUsage = accumulateUsage(totalUsage, result.usage);
 		previousOutput = result.output;
 
-		// Stop on error
+		// Stop on error — surface the failing step's error as finalOutput (the pipeline
+		// tool returns finalOutput as content, so the main LLM sees the actual failure,
+		// not the previous step's success text).
 		if (result.exitCode !== 0 || result.progress.error) {
+			const errorDetail = buildPipelineErrorContent(i, step.agent, result);
 			return {
-				steps: results, finalOutput: previousOutput,
+				steps: results, finalOutput: errorDetail,
 				stoppedAt: i, error: result.progress.error || `Agent ${step.agent} exited with code ${result.exitCode}`,
 				totalUsage, totalDurationMs: Date.now() - startTime,
 			};
@@ -1062,8 +1193,9 @@ async function runLoop(
 
 		if (result.exitCode !== 0 || result.progress.error) {
 			stoppedBecause = "error";
+			const errorDetail = buildLoopErrorContent(i, agentName, result);
 			return {
-				iterations, finalOutput: result.output || "(error)",
+				iterations, finalOutput: errorDetail,
 				stoppedBecause, totalUsage, totalDurationMs: Date.now() - startTime,
 			};
 		}
@@ -1239,8 +1371,8 @@ function renderLoopResult(
 // ── Extension ─────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	const config = loadConfig();
-	semaphore = new Semaphore(config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
+	extensionConfig = loadConfig();
+	semaphore = new Semaphore(extensionConfig.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
 	agents = loadAgents();
 
 	// If spawned as a child by a parent subagent process, PI_SUBAGENT_ALLOWED
@@ -1262,6 +1394,7 @@ export default function (pi: ExtensionAPI) {
 			"Use subagent to delegate *reasoning and decisions*: codebase exploration (scout), web research (researcher), or isolated code changes (worker)",
 			"For multiple independent subagent tasks, emit multiple `subagent` tool calls in the same turn — they run in parallel automatically.",
 			"Subagents have NO context from the current conversation — include ALL necessary context in the task description",
+			"When a subagent returns an error, read it carefully. For transient failures (timeout, API/network), retry once with the same task plus 'Previous attempt failed with: {error}'. For structural failures (wrong approach, missing context), simplify the task or switch agents. If it persists after retry, report to the user with the specific error.",
 		],
 		parameters: Type.Object({
 			agent: Type.String({ description: "Name of the agent to invoke" }),
@@ -1296,9 +1429,10 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const result = await semaphore.run(() =>
-				runSubagent(agent, params.task!, params.cwd ?? cwd, signal, (progress, usage) => {
+				runSubagent(agent, params.task!, params.cwd ?? cwd, signal, (progress, usage, finalExitCode) => {
 					liveResult.progress = progress;
 					liveResult.usage = { ...usage };
+					if (finalExitCode !== undefined) liveResult.exitCode = finalExitCode;
 					onUpdate?.({
 						content: [{ type: "text", text: "(running...)" }],
 						details: { results: [liveResult] },
@@ -1308,8 +1442,11 @@ export default function (pi: ExtensionAPI) {
 
 			result.contextWindow = contextWindow;
 			const isError = result.exitCode !== 0 || !!result.progress.error;
+			const contentText = isError
+				? buildSubagentErrorContent(result)
+				: (result.output || "(no output)");
 			return {
-				content: [{ type: "text", text: result.output || "(no output)" }],
+				content: [{ type: "text", text: contentText }],
 				details: { results: [result] },
 				...(isError ? { isError: true } : {}),
 			};
@@ -1403,7 +1540,8 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use pipeline when a task naturally decomposes into sequential agent roles (e.g. explore → plan → implement → review).",
 			"Each step receives the previous step's output automatically via {previous} placeholder substitution.",
-			"Pipelines stop on first error. The finalOutput is the last successful step's output.",
+			"Pipelines stop on first error. The finalOutput is the failing step's error detail.",
+			"When a pipeline fails at a step, the error identifies which step and why. Retry the failing step with a simpler task, or re-scope the pipeline. Early-step (exploration) failures → retry the whole pipeline with a more focused scope.",
 		],
 		parameters: Type.Object({
 			steps: Type.Array(
@@ -1535,6 +1673,7 @@ export default function (pi: ExtensionAPI) {
 			"Use loop for tasks that benefit from iterative refinement (e.g. drafting → reviewing → polishing).",
 			"Configure a judge agent to stop early when quality is sufficient, avoiding wasted iterations.",
 			"Each iteration receives all prior outputs as context, enabling progressive improvement.",
+			"When a loop iteration fails, the error shows which iteration. Reduce max_iterations or simplify the task; if the judge consistently rejects, refine the criteria or switch judge agent.",
 		],
 		parameters: Type.Object({
 			agent: Type.String({ description: "Agent name to run in the loop" }),
