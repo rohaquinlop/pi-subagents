@@ -17,6 +17,7 @@ import "./tools/safe-bash";
 import type { AgentConfig, AgentUsage, PipelineStepResult, PipelineResult, LoopIterationResult, LoopResult } from "./lib/types";
 import { discoverAgents, mergeAgents, substitutePlaceholders, formatConnectorContext } from "./lib/helpers";
 import { zeroUsage, accumulateUsage, validateAgents, MAX_LOOP_CONTEXT, parseJudgeVerdict } from "./lib/pipeline-helpers";
+import { buildSubagentErrorContent } from "./lib/error-helpers";
 
 interface ToolEvent {
 	tool: string;
@@ -1369,8 +1370,11 @@ export default function (pi: ExtensionAPI) {
 
 			result.contextWindow = contextWindow;
 			const isError = result.exitCode !== 0 || !!result.progress.error;
+			const contentText = isError
+				? buildSubagentErrorContent(result)
+				: (result.output || "(no output)");
 			return {
-				content: [{ type: "text", text: result.output || "(no output)" }],
+				content: [{ type: "text", text: contentText }],
 				details: { results: [result] },
 				...(isError ? { isError: true } : {}),
 			};
