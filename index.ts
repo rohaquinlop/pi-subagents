@@ -509,7 +509,7 @@ async function runSubagent(
 	task: string,
 	cwd: string,
 	signal: AbortSignal | undefined,
-	onUpdate?: (progress: AgentProgress, usage: AgentResult["usage"]) => void,
+	onUpdate?: (progress: AgentProgress, usage: AgentResult["usage"], finalExitCode?: number) => void,
 ): Promise<AgentResult> {
 	const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd);
 	const command = args[0];
@@ -752,6 +752,13 @@ async function runSubagent(
 	result.exitCode = exitCode;
 	progress.status = exitCode === 0 && !progress.error ? "completed" : "failed";
 	progress.durationMs = Date.now() - startTime;
+
+	// Push the terminal status to the live renderer so the TUI doesn't keep
+	// showing "running" after the child has exited. Pass exitCode so callers
+	// that hold a live result object (the subagent tool) can sync its exitCode
+	// and render the correct ✓/✗ icon instead of the -1 placeholder.
+	onUpdate?.(progress, result.usage, exitCode);
+
 	if (progress.error) result.output = result.output || `Error: ${progress.error}`;
 
 	// Truncate output if very large
@@ -1367,9 +1374,10 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const result = await semaphore.run(() =>
-				runSubagent(agent, params.task!, params.cwd ?? cwd, signal, (progress, usage) => {
+				runSubagent(agent, params.task!, params.cwd ?? cwd, signal, (progress, usage, finalExitCode) => {
 					liveResult.progress = progress;
 					liveResult.usage = { ...usage };
+					if (finalExitCode !== undefined) liveResult.exitCode = finalExitCode;
 					onUpdate?.({
 						content: [{ type: "text", text: "(running...)" }],
 						details: { results: [liveResult] },
