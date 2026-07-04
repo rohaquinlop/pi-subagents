@@ -38,3 +38,29 @@ export function buildSubagentErrorContent(result: SubagentErrorResult): string {
 	}
 	return parts.join("\n");
 }
+
+export function buildPipelineErrorContent(
+	stepIndex: number,
+	stepAgent: string,
+	result: { exitCode: number; output: string; progress: { error?: string } },
+): string {
+	return [
+		`Pipeline failed at step ${stepIndex + 1} (agent: ${stepAgent}).`,
+		`Exit code: ${result.exitCode}`,
+		result.progress.error ? `Error: ${result.progress.error}` : null,
+		result.output ? `Output:\n${result.output}` : "(no output)",
+	].filter(Boolean).join("\n");
+}
+
+export function buildLoopErrorContent(
+	iteration: number,
+	agentName: string,
+	result: { exitCode: number; output: string; progress: { error?: string } },
+): string {
+	return [
+		`Loop failed at iteration ${iteration + 1} (agent: ${agentName}).`,
+		`Exit code: ${result.exitCode}`,
+		result.progress.error ? `Error: ${result.progress.error}` : null,
+		result.output ? `Output:\n${result.output}` : "(no output)",
+	].filter(Boolean).join("\n");
+}

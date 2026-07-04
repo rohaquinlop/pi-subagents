@@ -17,7 +17,7 @@ import "./tools/safe-bash";
 import type { AgentConfig, AgentUsage, PipelineStepResult, PipelineResult, LoopIterationResult, LoopResult } from "./lib/types";
 import { discoverAgents, mergeAgents, substitutePlaceholders, formatConnectorContext } from "./lib/helpers";
 import { zeroUsage, accumulateUsage, validateAgents, MAX_LOOP_CONTEXT, parseJudgeVerdict } from "./lib/pipeline-helpers";
-import { buildSubagentErrorContent } from "./lib/error-helpers";
+import { buildSubagentErrorContent, buildPipelineErrorContent, buildLoopErrorContent } from "./lib/error-helpers";
 
 interface ToolEvent {
 	tool: string;
@@ -1032,12 +1032,7 @@ async function runPipeline(
 		// tool returns finalOutput as content, so the main LLM sees the actual failure,
 		// not the previous step's success text).
 		if (result.exitCode !== 0 || result.progress.error) {
-			const errorDetail = [
-				`Pipeline failed at step ${i + 1} (agent: ${step.agent}).`,
-				`Exit code: ${result.exitCode}`,
-				result.progress.error ? `Error: ${result.progress.error}` : null,
-				result.output ? `Output:\n${result.output}` : "(no output)",
-			].filter(Boolean).join("\n");
+			const errorDetail = buildPipelineErrorContent(i, step.agent, result);
 			return {
 				steps: results, finalOutput: errorDetail,
 				stoppedAt: i, error: result.progress.error || `Agent ${step.agent} exited with code ${result.exitCode}`,
@@ -1139,12 +1134,7 @@ async function runLoop(
 
 		if (result.exitCode !== 0 || result.progress.error) {
 			stoppedBecause = "error";
-			const errorDetail = [
-				`Loop failed at iteration ${i + 1} (agent: ${agentName}).`,
-				`Exit code: ${result.exitCode}`,
-				result.progress.error ? `Error: ${result.progress.error}` : null,
-				result.output ? `Output:\n${result.output}` : "(no output)",
-			].filter(Boolean).join("\n");
+			const errorDetail = buildLoopErrorContent(i, agentName, result);
 			return {
 				iterations, finalOutput: errorDetail,
 				stoppedBecause, totalUsage, totalDurationMs: Date.now() - startTime,
