@@ -6,6 +6,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
+const DEFAULT_SAFE_BASH_TIMEOUT_S = 300; // 5 minutes — kills stuck commands instead of relying on the 10-min wall-clock
+
 const DANGEROUS_PATTERNS = [
 	/\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?(-[a-zA-Z]*r[a-zA-Z]*\s+)?(\/|~\/?\s|~\/?\b)/,
 	/\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?(-[a-zA-Z]*f[a-zA-Z]*\s+)?(\/|~\/?\s|~\/?\b)/,
@@ -46,7 +48,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			command: Type.String({ description: "Bash command to execute" }),
 			timeout: Type.Optional(
-				Type.Number({ description: "Timeout in seconds (optional)" }),
+				Type.Number({ description: "Timeout in seconds (default: 300s/5min; pass a larger value for builds/tests/installs)" }),
 			),
 		}),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -54,7 +56,8 @@ export default function (pi: ExtensionAPI) {
 			if (danger) {
 				throw new Error(danger);
 			}
-			return bashTool.execute(toolCallId, params, signal, onUpdate);
+			const timeout = params.timeout ?? DEFAULT_SAFE_BASH_TIMEOUT_S;
+			return bashTool.execute(toolCallId, { ...params, timeout }, signal, onUpdate);
 		},
 	});
 }

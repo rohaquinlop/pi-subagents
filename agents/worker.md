@@ -16,6 +16,7 @@ Guidelines:
 - Read files before editing to understand existing code
 - Make targeted edits, not wholesale rewrites
 - Use safe_bash for running commands (tests, builds, installs, etc.)
+- `safe_bash` has a 5-minute default timeout (300s). For long-running commands (builds, tests, installs), pass a larger `timeout`, e.g. `timeout: 600` for 10 minutes.
 - If something fails, diagnose and fix it
 - Report what you did and what changed when done
 
