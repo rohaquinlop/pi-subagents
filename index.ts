@@ -555,6 +555,7 @@ async function runSubagent(
 		let resolved = false;
 		let wallTimer: ReturnType<typeof setTimeout> | undefined;
 		let idleTimer: ReturnType<typeof setTimeout> | undefined;
+		let inFlightToolCount = 0;
 		let childClosed = false;
 		let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -597,16 +598,26 @@ async function runSubagent(
 		};
 		resetIdle();
 
+		const pauseIdle = () => {
+			clearTimeout(idleTimer);
+			idleTimer = undefined;
+		};
+		const resumeIdle = () => {
+			if (inFlightToolCount === 0) resetIdle();
+		};
+
 		const MAX_STDERR_BYTES = 100_000;
 
 		const processLine = (line: string) => {
-			resetIdle();
+			if (inFlightToolCount === 0) resetIdle();
 			if (!line.trim()) return;
 			try {
 				const evt = JSON.parse(line) as any;
 				progress.durationMs = Date.now() - startTime;
 
 				if (evt.type === "tool_execution_start") {
+					inFlightToolCount++;
+					pauseIdle();
 					progress.toolCount++;
 					progress.recentTools.push({
 						tool: evt.toolName,
@@ -648,6 +659,8 @@ async function runSubagent(
 							hit.children = finalChildren as AgentResult[];
 						}
 					}
+					inFlightToolCount = Math.max(0, inFlightToolCount - 1);
+					resumeIdle();
 					fireUpdate();
 				}
 
