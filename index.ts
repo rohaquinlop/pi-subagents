@@ -78,6 +78,8 @@ interface Details {
 
 interface ExtensionConfig {
 	maxConcurrency?: number;
+	subagentTimeoutMs?: number;      // wall-clock, default 600000 (10 min). 0 = disabled.
+	subagentIdleTimeoutMs?: number;  // no-stdout watchdog, default 300000 (5 min). 0 = disabled.
 }
 
 const EXT_DIR = path.dirname(new URL(import.meta.url).pathname);
@@ -85,6 +87,10 @@ const AGENTS_DIR = path.join(EXT_DIR, "agents");
 const TOOLS_DIR = path.join(EXT_DIR, "tools");
 const CONFIG_PATH = path.join(EXT_DIR, "config.json");
 const DEFAULT_MAX_CONCURRENCY = 4;
+const DEFAULT_SUBAGENT_TIMEOUT_MS = 600_000;     // 10 minutes
+const DEFAULT_SUBAGENT_IDLE_TIMEOUT_MS = 300_000; // 5 minutes
+
+let extensionConfig: ExtensionConfig = {};
 
 function loadConfig(): ExtensionConfig {
 	try {
@@ -544,8 +550,55 @@ async function runSubagent(
 
 		let buf = "";
 		let stderrBuf = "";
+		let resolved = false;
+		let wallTimer: ReturnType<typeof setTimeout> | undefined;
+		let idleTimer: ReturnType<typeof setTimeout> | undefined;
+		let childClosed = false;
+		let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
+
+		const safeResolve = (code: number) => {
+			if (resolved) return;
+			resolved = true;
+			clearTimeout(wallTimer);
+			clearTimeout(idleTimer);
+			clearTimeout(sigkillTimer);
+			if (signal) signal.removeEventListener("abort", abortKill);
+			resolve(code);
+		};
+
+		// Wall-clock timeout
+		const timeoutMs = extensionConfig.subagentTimeoutMs ?? DEFAULT_SUBAGENT_TIMEOUT_MS;
+		if (timeoutMs > 0) {
+			wallTimer = setTimeout(() => {
+				if (!progress.error) progress.error = `Subagent timed out after ${Math.round(timeoutMs / 1000)}s`;
+				proc.kill("SIGTERM");
+				clearTimeout(sigkillTimer);
+				sigkillTimer = setTimeout(() => {
+					if (!childClosed) proc.kill("SIGKILL");
+				}, 5000);
+			}, timeoutMs);
+		}
+
+		// Idle (no-stdout) watchdog
+		const idleMs = extensionConfig.subagentIdleTimeoutMs ?? DEFAULT_SUBAGENT_IDLE_TIMEOUT_MS;
+		const resetIdle = () => {
+			if (idleMs <= 0) return;
+			clearTimeout(idleTimer);
+			idleTimer = setTimeout(() => {
+				if (!progress.error) progress.error = `Subagent idle for ${Math.round(idleMs / 1000)}s — likely stuck`;
+				proc.kill("SIGTERM");
+				clearTimeout(sigkillTimer);
+				sigkillTimer = setTimeout(() => {
+					if (!childClosed) proc.kill("SIGKILL");
+				}, 5000);
+			}, idleMs);
+		};
+		resetIdle();
+
+		const MAX_STDERR_BYTES = 100_000;
 
 		const processLine = (line: string) => {
+			resetIdle();
 			if (!line.trim()) return;
 			try {
 				const evt = JSON.parse(line) as any;
@@ -659,26 +712,34 @@ async function runSubagent(
 		});
 
 		proc.stderr.on("data", (d: Buffer) => {
+			if (stderrBuf.length >= MAX_STDERR_BYTES) return;
 			stderrBuf += d.toString();
+			if (stderrBuf.length >= MAX_STDERR_BYTES) {
+				stderrBuf = stderrBuf.slice(0, MAX_STDERR_BYTES) + "\n[stderr truncated]";
+			}
 		});
 
 		proc.on("close", (code) => {
+			childClosed = true;
 			if (buf.trim()) processLine(buf);
 			if (code !== 0 && stderrBuf.trim() && !progress.error) {
 				progress.error = stderrBuf.trim();
 			}
-			resolve(code ?? 1);
+			safeResolve(code ?? 1);
 		});
 
-		proc.on("error", () => resolve(1));
+		proc.on("error", () => safeResolve(1));
 
+		const abortKill = () => {
+			proc.kill("SIGTERM");
+			clearTimeout(sigkillTimer);
+			sigkillTimer = setTimeout(() => {
+				if (!childClosed) proc.kill("SIGKILL");
+			}, 3000);
+		};
 		if (signal) {
-			const kill = () => {
-				proc.kill("SIGTERM");
-				setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
-			};
-			if (signal.aborted) kill();
-			else signal.addEventListener("abort", kill, { once: true });
+			if (signal.aborted) abortKill();
+			else signal.addEventListener("abort", abortKill, { once: true });
 		}
 	});
 
@@ -1239,8 +1300,8 @@ function renderLoopResult(
 // ── Extension ─────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	const config = loadConfig();
-	semaphore = new Semaphore(config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
+	extensionConfig = loadConfig();
+	semaphore = new Semaphore(extensionConfig.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
 	agents = loadAgents();
 
 	// If spawned as a child by a parent subagent process, PI_SUBAGENT_ALLOWED
