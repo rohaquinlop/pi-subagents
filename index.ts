@@ -488,6 +488,11 @@ function flatten(s: string): string {
 // doesn't need to read inline anyway.
 const MAX_ARG_PREVIEW = 4000;
 
+// Hard cap on recentTools entries to prevent unbounded memory growth in
+// long-running subagents. Generous for expanded-view history; matches the
+// callHistory trim pattern.
+const MAX_RECENT_TOOLS = 50;
+
 function extractToolArgsPreview(args: Record<string, unknown>): string {
 	const cap = (s: string) => (s.length > MAX_ARG_PREVIEW ? s.slice(0, MAX_ARG_PREVIEW) + "…" : s);
 	if (args.command) return cap(flatten(String(args.command)));
@@ -627,6 +632,14 @@ async function runSubagent(
 						toolCallId: evt.toolCallId,
 						status: "running",
 					});
+					// Trim oldest completed entries, but never evict an in-flight tool —
+					// otherwise tool_execution_end's .find(toolCallId) would no-op and leave a
+					// permanently-"running" ghost.
+					while (progress.recentTools.length > MAX_RECENT_TOOLS) {
+						const idx = progress.recentTools.findIndex((t) => t.status !== "running");
+						if (idx === -1) break; // only running entries left — don't evict in-flight
+						progress.recentTools.splice(idx, 1);
+					}
 					// ── Cycle detection (parent-side, context-free) ──
 					// Signature = toolName + args preview. Two calls with different args
 					// (different file, or same file different content) → different sig.
