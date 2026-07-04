@@ -1139,8 +1139,14 @@ async function runLoop(
 
 		if (result.exitCode !== 0 || result.progress.error) {
 			stoppedBecause = "error";
+			const errorDetail = [
+				`Loop failed at iteration ${i + 1} (agent: ${agentName}).`,
+				`Exit code: ${result.exitCode}`,
+				result.progress.error ? `Error: ${result.progress.error}` : null,
+				result.output ? `Output:\n${result.output}` : "(no output)",
+			].filter(Boolean).join("\n");
 			return {
-				iterations, finalOutput: result.output || "(error)",
+				iterations, finalOutput: errorDetail,
 				stoppedBecause, totalUsage, totalDurationMs: Date.now() - startTime,
 			};
 		}
