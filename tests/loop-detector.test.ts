@@ -86,4 +86,61 @@ describe("detectCycle", () => {
         const result = detectCycle(history, pattern[8]);
         expect(result.cycle).toBe(false);
     });
+
+    // ── Integration: subagent cycle-signature behavior ───────────────────
+
+    it("does NOT trigger on 6 different subagent delegations (different tasks)", () => {
+        // This is the false-positive scenario that the cycle-signature fix addresses.
+        // 6 delegations to the same agent with different tasks produce different hashes.
+        const sigs = [
+            "subagent:scout:a1b2c3d4e5f6",
+            "subagent:scout:b2c3d4e5f6a1",
+            "subagent:scout:c3d4e5f6a1b2",
+            "subagent:scout:d4e5f6a1b2c3",
+            "subagent:scout:e5f6a1b2c3d4",
+            "subagent:scout:f6a1b2c3d4e5",
+        ];
+        let history: string[] = [];
+        for (const sig of sigs) {
+            const result = detectCycle(history, sig);
+            expect(result.cycle).toBe(false);
+            history.push(sig);
+        }
+    });
+
+    it("detects cycle on 6 identical subagent delegations (same task)", () => {
+        // True positive: 6 identical delegations should still be caught.
+        const sig = "subagent:scout:abcdef123456";
+        const history = [sig, sig, sig, sig, sig];
+        const result = detectCycle(history, sig);
+        expect(result.cycle).toBe(true);
+    });
+
+    // ── Integration: read pagination cycle-signature behavior ────────────
+
+    it("does NOT trigger on 6 reads of same file at different offsets (pagination)", () => {
+        // This is the pagination false-positive scenario.
+        const sigs = [
+            "read:src/index.ts@0",
+            "read:src/index.ts@120",
+            "read:src/index.ts@240",
+            "read:src/index.ts@360",
+            "read:src/index.ts@480",
+            "read:src/index.ts@600",
+        ];
+        let history: string[] = [];
+        for (const sig of sigs) {
+            const result = detectCycle(history, sig);
+            expect(result.cycle).toBe(false);
+            history.push(sig);
+        }
+    });
+
+    it("detects cycle on 6 reads of same file at same offset", () => {
+        // True positive: reading the exact same thing 6 times is a loop.
+        const sig = "read:src/index.ts@0";
+        const history = [sig, sig, sig, sig, sig];
+        const result = detectCycle(history, sig);
+        expect(result.cycle).toBe(true);
+    });
 });

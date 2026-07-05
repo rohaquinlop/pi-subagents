@@ -19,6 +19,9 @@ import { discoverAgents, mergeAgents, substitutePlaceholders, formatConnectorCon
 import { zeroUsage, accumulateUsage, validateAgents, MAX_LOOP_CONTEXT, parseJudgeVerdict } from "./lib/pipeline-helpers";
 import { buildSubagentErrorContent, buildPipelineErrorContent, buildLoopErrorContent } from "./lib/error-helpers";
 import { detectCycle } from "./lib/loop-detector";
+import { extractCycleSignature, LOOP_PRIOR_ITERATIONS_HEADER } from "./lib/cycle-signature";
+import { validateAgentGraphAcyclicity } from "./lib/agent-graph";
+import { checkDepth } from "./lib/depth-limit";
 
 interface ToolEvent {
 	tool: string;
@@ -83,6 +86,7 @@ interface ExtensionConfig {
 	maxConcurrency?: number;
 	subagentTimeoutMs?: number;      // wall-clock, default 600000 (10 min). 0 = disabled.
 	subagentIdleTimeoutMs?: number;  // no-stdout watchdog, default 300000 (5 min). 0 = disabled.
+	maxSubagentDepth?: number;       // max nesting depth, default 8. Hard backstop against recursion loops.
 }
 
 const EXT_DIR = path.dirname(new URL(import.meta.url).pathname);
@@ -379,6 +383,15 @@ async function buildPiArgs(
 	cwd: string,
 ): Promise<{ args: string[]; tempDir: string; childEnv: NodeJS.ProcessEnv }> {
 	const piBin = resolvePiBinary();
+
+	// Depth check (before resource allocation to avoid temp-dir leaks on throw)
+	const currentDepth = parseInt(process.env.PI_SUBAGENT_DEPTH || "0", 10);
+	const maxDepth = extensionConfig.maxSubagentDepth ?? 8;
+	const depthResult = checkDepth(currentDepth, maxDepth);
+	if (!depthResult.allowed) {
+		throw new Error(depthResult.error!);
+	}
+
 	const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-sub-"));
 
 	// Write system prompt to temp file
@@ -459,6 +472,8 @@ async function buildPiArgs(
 	if (agent.tools.includes("subagent") && agent.subagentAgents && agent.subagentAgents.length > 0) {
 		childEnv.PI_SUBAGENT_ALLOWED = agent.subagentAgents.join(",");
 	}
+
+	childEnv.PI_SUBAGENT_DEPTH = String(depthResult.newDepth);
 
 	return { args: [piBin.command, ...args], tempDir, childEnv };
 }
@@ -565,6 +580,13 @@ async function runSubagent(
 		let childClosed = false;
 		let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
 		let callHistory: string[] = [];	// sliding window of tool-call signatures for cycle detection
+		// NOTE: Cycle detection is PER-CHILD — each runSubagent() call has its own
+		// fresh callHistory. Cross-step loops in pipeline (A→B→A→B) and cross-iteration
+		// re-delegation in loop are NOT caught by the tool-call detector. They are
+		// bounded instead by: pipeline's 2-5 step cap, loop's 2-5 iteration cap, the
+		// depth cap (default 8), and wall-clock (10 min) + idle (5 min) timeouts.
+		// This is a deliberate tradeoff — per-child detection avoids false positives
+		// from parallel siblings sharing history.
 
 		const safeResolve = (code: number) => {
 			if (resolved) return;
@@ -643,7 +665,7 @@ async function runSubagent(
 					// ── Cycle detection (parent-side, context-free) ──
 					// Signature = toolName + args preview. Two calls with different args
 					// (different file, or same file different content) → different sig.
-					const sig = `${evt.toolName}:${extractToolArgsPreview((evt.args || {}) as Record<string, unknown>)}`;
+					const sig = extractCycleSignature(evt.toolName, (evt.args || {}) as Record<string, unknown>);
 					const cycleResult = detectCycle(callHistory, sig);
 					callHistory.push(sig);
 					if (callHistory.length > 24) callHistory = callHistory.slice(-24);
@@ -1145,7 +1167,7 @@ async function runLoop(
 				}
 			}
 			const contextBlock = keptOutputs.join("\n\n");
-			fullTask = `${task}\n\n## Prior iterations:\n${contextBlock}`;
+			fullTask = `${task}\n\n${LOOP_PRIOR_ITERATIONS_HEADER}\n${contextBlock}`;
 		}
 
 		const iterStart = Date.now();
@@ -1374,6 +1396,13 @@ export default function (pi: ExtensionAPI) {
 	extensionConfig = loadConfig();
 	semaphore = new Semaphore(extensionConfig.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
 	agents = loadAgents();
+
+	// Validate agent graph acyclicity (warning only — depth cap backstops recursion)
+	const cycleError = validateAgentGraphAcyclicity(agents);
+	if (cycleError) {
+		console.error(`[pi-subagents] WARNING: ${cycleError}`);
+		console.error(`[pi-subagents] The depth cap (maxSubagentDepth=${extensionConfig.maxSubagentDepth ?? 8}) prevents infinite recursion, but this agent configuration should be fixed.`);
+	}
 
 	// If spawned as a child by a parent subagent process, PI_SUBAGENT_ALLOWED
 	// pins which agents we're allowed to expose. Filter the registry now, before
