@@ -1,42 +1,42 @@
 {
-  "name": "@rohaquinlop/pi-subagents",
-  "version": "0.4.0",
-  "description": "Pi extension for delegating tasks to subagents — parallel execution, agent discovery, and TUI rendering",
-  "keywords": [
-    "pi-package",
-    "subagent",
-    "parallel",
-    "coding-agent",
-    "extension"
-  ],
-  "license": "MIT",
-  "author": "rohaquinlop",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/rohaquinlop/pi-subagents.git"
-  },
-  "files": [
-    "index.ts",
-    "agents/",
-    "tools/",
-    "lib/",
-    "README.md"
-  ],
-  "pi": {
-    "extensions": [
-      "./index.ts"
-    ]
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "@sinclair/typebox": "*"
-  },
-  "scripts": {
-    "test": "vitest run",
-    "test:watch": "vitest"
-  },
-  "devDependencies": {
-    "vitest": "^3.2.0"
-  }
+    "name": "@rohaquinlop/pi-subagents",
+    "version": "0.5.0",
+    "description": "Pi extension for delegating tasks to subagents — parallel execution, agent discovery, and TUI rendering",
+    "keywords": [
+        "pi-package",
+        "subagent",
+        "parallel",
+        "coding-agent",
+        "extension"
+    ],
+    "license": "MIT",
+    "author": "rohaquinlop",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/rohaquinlop/pi-subagents.git"
+    },
+    "files": [
+        "index.ts",
+        "agents/",
+        "tools/",
+        "lib/",
+        "README.md"
+    ],
+    "pi": {
+        "extensions": [
+            "./index.ts"
+        ]
+    },
+    "peerDependencies": {
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
+        "@sinclair/typebox": "*"
+    },
+    "scripts": {
+        "test": "vitest run",
+        "test:watch": "vitest"
+    },
+    "devDependencies": {
+        "vitest": "^3.2.0"
+    }
 }
