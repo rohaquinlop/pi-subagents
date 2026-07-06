@@ -1,13 +1,20 @@
 /**
  * Cycle detector for tool-call streams. Watches a sliding window of
  * tool-call signatures for a sub-sequence of length P repeated 3 times
- * (P in [2,8]). Catches an agent stuck in a tool-call loop without
+ * (P in [1,8]). Catches an agent stuck in a tool-call loop without
  * imposing any count cap on legitimate work. Purely parent-side.
  */
 const WINDOW_SIZE = 24;
-const MIN_PATTERN_LEN = 2;
+const MIN_PATTERN_LEN = 1;
 const MAX_PATTERN_LEN = 8;
 const REPETITIONS = 3;
+
+/**
+ * Prefix for loop-detection error messages. Shared as a constant so that
+ * both the error-generation site (in index.ts) and the retry-detection site
+ * use the same string, avoiding fragile substring matching.
+ */
+export const LOOP_ERROR_PREFIX = "Subagent stuck in a tool-call loop";
 
 export interface CycleResult {
     cycle: boolean;

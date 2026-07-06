@@ -18,7 +18,7 @@ import type { AgentConfig, AgentUsage, PipelineStepResult, PipelineResult, LoopI
 import { discoverAgents, mergeAgents, substitutePlaceholders, formatConnectorContext } from "./lib/helpers";
 import { zeroUsage, accumulateUsage, validateAgents, MAX_LOOP_CONTEXT, parseJudgeVerdict } from "./lib/pipeline-helpers";
 import { buildSubagentErrorContent, buildPipelineErrorContent, buildLoopErrorContent } from "./lib/error-helpers";
-import { detectCycle } from "./lib/loop-detector";
+import { detectCycle, LOOP_ERROR_PREFIX } from "./lib/loop-detector";
 import { extractCycleSignature, LOOP_PRIOR_ITERATIONS_HEADER } from "./lib/cycle-signature";
 import { validateAgentGraphAcyclicity } from "./lib/agent-graph";
 import { checkDepth } from "./lib/depth-limit";
@@ -61,6 +61,7 @@ interface AgentProgress {
 	lastMessage: string;
 	error?: string;
 	warning?: string;
+	retriedAfterLoop?: boolean;
 }
 
 interface AgentResult {
@@ -526,7 +527,7 @@ function extractToolArgsPreview(args: Record<string, unknown>): string {
 	return cap(flatten(JSON.stringify(args)));
 }
 
-async function runSubagent(
+async function spawnAndWait(
 	agent: AgentConfig,
 	task: string,
 	cwd: string,
@@ -564,8 +565,14 @@ async function runSubagent(
 		onUpdate?.(progress, result.usage);
 	}, 150);
 
-	const exitCode = await new Promise<number>((resolve) => {
-		const proc = spawn(command, spawnArgs, {
+	const MAX_ATTEMPTS = 2; // 1 initial attempt + 1 retry
+	const MAX_PARTIAL_CONTEXT = 4000;
+
+	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+		const isRetry = attempt > 1;
+
+		const exitCode = await new Promise<number>((resolve) => {
+			const proc = spawn(command, spawnArgs, {
 			cwd,
 			stdio: ["ignore", "pipe", "pipe"],
 			env: childEnv,
@@ -677,7 +684,7 @@ async function runSubagent(
 						});
 						const patternStr = toolNames.join("→");
 						if (!progress.error) {
-							progress.error = `Subagent stuck in a tool-call loop: repeating ${patternStr}`;
+							progress.error = `${LOOP_ERROR_PREFIX}: repeating ${patternStr}`;
 						}
 						proc.kill("SIGTERM");
 						clearTimeout(sigkillTimer);
@@ -819,35 +826,74 @@ async function runSubagent(
 			if (signal.aborted) abortKill();
 			else signal.addEventListener("abort", abortKill, { once: true });
 		}
-	});
+		});
 
-	// Cleanup temp dir
-	try {
-		fs.rmSync(tempDir, { recursive: true, force: true });
-	} catch {}
+		// Cleanup temp dir after this attempt
+		try {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		} catch {}
 
-	result.exitCode = exitCode;
-	progress.status = exitCode === 0 && !progress.error ? "completed" : "failed";
-	progress.durationMs = Date.now() - startTime;
+		result.exitCode = exitCode;
+		progress.status = exitCode === 0 && !progress.error ? "completed" : "failed";
+		progress.durationMs = Date.now() - startTime;
 
-	// Push the terminal status to the live renderer so the TUI doesn't keep
-	// showing "running" after the child has exited. Pass exitCode so callers
-	// that hold a live result object (the subagent tool) can sync its exitCode
-	// and render the correct ✓/✗ icon instead of the -1 placeholder.
-	onUpdate?.(progress, result.usage, exitCode);
+		// Push the terminal status to the live renderer so the TUI doesn't keep
+		// showing "running" after the child has exited. Pass exitCode so callers
+		// that hold a live result object (the subagent tool) can sync its exitCode
+		// and render the correct icon instead of the -1 placeholder.
+		onUpdate?.(progress, result.usage, exitCode);
 
-	if (progress.error) result.output = result.output || `Error: ${progress.error}`;
+		if (progress.error) result.output = result.output || `Error: ${progress.error}`;
 
-	// Truncate output if very large
-	if (result.output.length > DEFAULT_MAX_BYTES) {
-		const trunc = truncateHead(result.output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-		result.output = trunc.content;
-		if (trunc.truncated) {
-			result.output += "\n\n[Output truncated]";
+		// Truncate output if very large
+		if (result.output.length > DEFAULT_MAX_BYTES) {
+			const trunc = truncateHead(result.output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+			result.output = trunc.content;
+			if (trunc.truncated) {
+				result.output += "\n\n[Output truncated]";
+			}
 		}
+
+		// Check if this was a loop error eligible for retry
+		const isLoopError = progress.error?.startsWith(LOOP_ERROR_PREFIX);
+
+		if (isLoopError && attempt < MAX_ATTEMPTS) {
+			// Note: result.output is overwritten (we want the best attempt's output),
+			// but result.usage accumulates (we want total cost across all attempts).
+			// Build retry task with partial context from the failed attempt
+			const partialOutput = (result.output || "").slice(0, MAX_PARTIAL_CONTEXT);
+			const retryContext = partialOutput
+				? `\n\n## Partial output from previous (looped) attempt:\n${partialOutput}`
+				: "";
+			task = `${task}${retryContext}`;
+
+			// Reset progress state for retry attempt
+			progress.status = "running";
+			progress.error = undefined;
+			progress.retriedAfterLoop = true;
+			progress.recentTools = [];
+			progress.toolCount = 0;
+			progress.tokens = 0;
+			progress.lastMessage = "";
+
+			continue; // retry with fresh callHistory
+		}
+
+		// Success or non-loop failure — return result
+		return result;
 	}
 
-	return result;
+	// Graceful degradation: retry loop exhausted, return best partial result
+	const degradedResult: AgentResult = {
+		...result,
+		output: result.output || "(no output)",
+		progress: {
+			...progress,
+			status: "failed" as const,
+			error: "Subagent failed after retry. Returning partial results.",
+		},
+	};
+	return degradedResult;
 }
 
 // ── Throttle ──────────────────────────────────────────────────────────

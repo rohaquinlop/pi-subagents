@@ -15,6 +15,7 @@ interface SubagentErrorResult {
 	progress: {
 		error?: string;
 		lastMessage?: string;
+		retriedAfterLoop?: boolean;
 	};
 }
 
@@ -27,6 +28,9 @@ interface SubagentErrorResult {
 export function buildSubagentErrorContent(result: SubagentErrorResult): string {
 	const parts: string[] = [];
 	parts.push(`[Subagent error] Agent "${result.agent}" failed (exit code ${result.exitCode}).`);
+	if (result.progress.retriedAfterLoop) {
+		parts.push("Note: Subagent was retried after loop detection with partial context.");
+	}
 	if (result.progress.error) {
 		parts.push(`Error: ${result.progress.error}`);
 	}
