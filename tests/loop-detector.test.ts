@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { detectCycle } from "../lib/loop-detector";
+import { detectCycle, LOOP_ERROR_PREFIX } from "../lib/loop-detector";
 
 describe("detectCycle", () => {
     it("returns no cycle on varied work", () => {
@@ -87,6 +87,13 @@ describe("detectCycle", () => {
         expect(result.cycle).toBe(false);
     });
 
+    // ── LOOP_ERROR_PREFIX constant ──────────────────────────────────────
+
+    it("exports LOOP_ERROR_PREFIX as a stable string constant", () => {
+        expect(typeof LOOP_ERROR_PREFIX).toBe("string");
+        expect(LOOP_ERROR_PREFIX).toBe("Subagent stuck in a tool-call loop");
+    });
+
     // ── Integration: subagent cycle-signature behavior ───────────────────
 
     it("does NOT trigger on 6 different subagent delegations (different tasks)", () => {
@@ -142,5 +149,25 @@ describe("detectCycle", () => {
         const history = [sig, sig, sig, sig, sig];
         const result = detectCycle(history, sig);
         expect(result.cycle).toBe(true);
+    });
+
+    it("detects cycle at 3 identical calls (threshold from MIN_PATTERN_LEN=1)", () => {
+        // With MIN_PATTERN_LEN=1 and REPETITIONS=3, a single identical call
+        // repeated 3 times should trigger cycle detection.
+        const sig = "edit:f.ts:same-content";
+        // 2 entries; newSig is 3rd → 3× [sig] (P=1, needed=3)
+        const history = [sig, sig];
+        const result = detectCycle(history, sig);
+        expect(result.cycle).toBe(true);
+        expect(result.pattern).toEqual([sig]);
+    });
+
+    it("does NOT trigger on 2 identical calls (below threshold)", () => {
+        // With MIN_PATTERN_LEN=1 and REPETITIONS=3, two identical calls
+        // should NOT trigger cycle detection (need 3).
+        const sig = "edit:f.ts:same-content";
+        const history = [sig];
+        const result = detectCycle(history, sig);
+        expect(result.cycle).toBe(false);
     });
 });

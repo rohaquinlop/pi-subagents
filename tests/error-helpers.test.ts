@@ -4,6 +4,7 @@ import {
     buildPipelineErrorContent,
     buildLoopErrorContent,
 } from "../lib/error-helpers";
+import { LOOP_ERROR_PREFIX } from "../lib/loop-detector";
 
 // ── buildSubagentErrorContent ─────────────────────────────────────────
 
@@ -13,6 +14,7 @@ describe("buildSubagentErrorContent", () => {
         lastMessage?: string;
         output?: string;
         exitCode?: number;
+        retriedAfterLoop?: boolean;
     } = {}) {
         return {
             agent: "test-agent",
@@ -21,6 +23,7 @@ describe("buildSubagentErrorContent", () => {
             progress: {
                 error: overrides.error,
                 lastMessage: overrides.lastMessage,
+                retriedAfterLoop: overrides.retriedAfterLoop,
             },
         };
     }
@@ -65,6 +68,49 @@ describe("buildSubagentErrorContent", () => {
     it("omits Output when output is (no output)", () => {
         const msg = buildSubagentErrorContent(makeResult({ output: "(no output)" }));
         expect(msg).not.toContain("Output:");
+    });
+
+    it("includes retry note when retriedAfterLoop is true", () => {
+        const msg = buildSubagentErrorContent(makeResult({
+            error: "Subagent stuck in a tool-call loop: repeating read→edit",
+            retriedAfterLoop: true,
+        }));
+        expect(msg).toContain("Note: Subagent was retried after loop detection with partial context.");
+        expect(msg).toContain("Error: Subagent stuck in a tool-call loop");
+    });
+
+    it("omits retry note when retriedAfterLoop is false", () => {
+        const msg = buildSubagentErrorContent(makeResult({
+            error: "some error",
+            retriedAfterLoop: false,
+        }));
+        expect(msg).not.toContain("retried after loop");
+    });
+
+    it("omits retry note when retriedAfterLoop is absent", () => {
+        const msg = buildSubagentErrorContent(makeResult({ error: "some error" }));
+        expect(msg).not.toContain("retried after loop");
+    });
+
+    it("includes graceful degradation error message when loop retries exhausted", () => {
+        const degradedError = "Subagent failed after retry. Returning partial results.";
+        const msg = buildSubagentErrorContent(makeResult({
+            error: degradedError,
+            output: "partial output from last attempt",
+        }));
+        expect(msg).toContain(degradedError);
+        expect(msg).toContain("Output:");
+        expect(msg).toContain("partial output from last attempt");
+    });
+
+    it("uses LOOP_ERROR_PREFIX in loop detection error messages", () => {
+        const loopError = `${LOOP_ERROR_PREFIX}: repeating read→edit`;
+        const msg = buildSubagentErrorContent(makeResult({
+            error: loopError,
+            retriedAfterLoop: true,
+        }));
+        expect(msg).toContain(LOOP_ERROR_PREFIX);
+        expect(msg).toContain("retried after loop detection");
     });
 });
 
