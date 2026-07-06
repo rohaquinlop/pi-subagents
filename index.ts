@@ -527,7 +527,7 @@ function extractToolArgsPreview(args: Record<string, unknown>): string {
 	return cap(flatten(JSON.stringify(args)));
 }
 
-async function spawnAndWait(
+async function runSubagent(
 	agent: AgentConfig,
 	task: string,
 	cwd: string,
