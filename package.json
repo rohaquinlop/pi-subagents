@@ -1,6 +1,6 @@
 {
     "name": "@rohaquinlop/pi-subagents",
-    "version": "0.5.2",
+    "version": "0.5.3",
     "description": "Pi extension for delegating tasks to subagents — parallel execution, agent discovery, and TUI rendering",
     "keywords": [
         "pi-package",
