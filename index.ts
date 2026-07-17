@@ -13,6 +13,7 @@ import { getMarkdownTheme, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTE
 import { Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import "./tools/safe-bash";
+import { configureSafeBash } from "./tools/safe-bash.js";
 
 import type { AgentConfig, AgentUsage, PipelineStepResult, PipelineResult, LoopIterationResult, LoopResult } from "./lib/types";
 import { discoverAgents, mergeAgents, substitutePlaceholders, formatConnectorContext } from "./lib/helpers";
@@ -88,6 +89,10 @@ interface ExtensionConfig {
 	subagentTimeoutMs?: number;      // wall-clock, default 600000 (10 min). 0 = disabled.
 	subagentIdleTimeoutMs?: number;  // no-stdout watchdog, default 300000 (5 min). 0 = disabled.
 	maxSubagentDepth?: number;       // max nesting depth, default 8. Hard backstop against recursion loops.
+	envAllowlist?: string[];         // additional env var names to pass through to child processes
+	envExtra?: Record<string, string>; // extra key-value pairs to inject into child process env
+	extraDangerousPatterns?: string[]; // additional regex patterns to block in safe_bash
+	safeCommands?: string[];         // commands to always allow in safe_bash
 }
 
 const EXT_DIR = path.dirname(new URL(import.meta.url).pathname);
@@ -107,6 +112,39 @@ function loadConfig(): ExtensionConfig {
 		}
 	} catch {}
 	return {};
+}
+
+export const ENV_ALLOWLIST_BASE = new Set([
+	"HOME", "PATH", "USER", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+	"TMPDIR", "TEMP", "TMP",
+	"NODE_OPTIONS", "NODE_PATH",
+	"PI_IS_SUBAGENT", "PI_SUBAGENT_ALLOWED", "PI_SUBAGENT_DEPTH",
+	"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY",
+	"GOOGLE_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
+	"MISTRAL_API_KEY", "COHERE_API_KEY", "XAI_API_KEY",
+	"OPENROUTER_API_KEY", "TOGETHER_API_KEY", "FIREWORKS_API_KEY",
+	"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION",
+	"AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT",
+	"BRAVE_API_KEY", "GITHUB_TOKEN", "GH_TOKEN",
+]);
+
+export function buildChildEnv(
+	overrides: Record<string, string>,
+	extraAllowlist?: string[],
+): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = {};
+	for (const key of ENV_ALLOWLIST_BASE) {
+		if (process.env[key] !== undefined) env[key] = process.env[key];
+	}
+	if (extraAllowlist) {
+		for (const key of extraAllowlist) {
+			if (process.env[key] !== undefined) env[key] = process.env[key];
+		}
+	}
+	for (const [key, value] of Object.entries(overrides)) {
+		env[key] = value;
+	}
+	return env;
 }
 
 // Built-in tools that pi provides natively (no extension needed)
@@ -467,14 +505,17 @@ async function buildPiArgs(
 
 	// Always mark child processes so extensions (register-agents.ts) can detect
 	// them and skip tool blocking. Child agents need full tool access.
-	const childEnv: NodeJS.ProcessEnv = { ...process.env, PI_IS_SUBAGENT: "1" };
+	const overrides: Record<string, string> = { PI_IS_SUBAGENT: "1" };
 
 	// If this agent has a spawn allowlist, restrict which agents the child sees
 	if (agent.tools.includes("subagent") && agent.subagentAgents && agent.subagentAgents.length > 0) {
-		childEnv.PI_SUBAGENT_ALLOWED = agent.subagentAgents.join(",");
+		overrides.PI_SUBAGENT_ALLOWED = agent.subagentAgents.join(",");
 	}
 
-	childEnv.PI_SUBAGENT_DEPTH = String(depthResult.newDepth);
+	overrides.PI_SUBAGENT_DEPTH = String(depthResult.newDepth);
+
+	if (extensionConfig.envExtra) Object.assign(overrides, extensionConfig.envExtra);
+	const childEnv = buildChildEnv(overrides, extensionConfig.envAllowlist);
 
 	return { args: [piBin.command, ...args], tempDir, childEnv };
 }
@@ -1442,6 +1483,12 @@ export default function (pi: ExtensionAPI) {
 	extensionConfig = loadConfig();
 	semaphore = new Semaphore(extensionConfig.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
 	agents = loadAgents();
+
+	// Wire up safe-bash config from ExtensionConfig
+	configureSafeBash({
+		exttraDangerousPatterns: extensionConfig.extraDangerousPatterns,
+		safeCommands: extensionConfig.safeCommands,
+	});
 
 	// Validate agent graph acyclicity (warning only — depth cap backstops recursion)
 	const cycleError = validateAgentGraphAcyclicity(agents);
