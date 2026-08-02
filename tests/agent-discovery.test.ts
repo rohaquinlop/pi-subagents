@@ -51,7 +51,30 @@ describe("parseAgentMd", () => {
         const content = `---\nname: scout\ndescription: Fast recon\ntools: read,ls\nmodel: deepseek-v4-flash\nthinking: medium\nconnector: "## Key findings\\n\\n{output}"\n---\nYou are a scout agent.`;
         const result = parseAgentMd(content, "agents/scout.md");
         expect(result).not.toBeNull();
-        expect(result!.connector).toBe("## Key findings\\n\\n{output}");
+        // Frontmatter is line-based, so a multi-line template has to be written
+        // with escapes. They are resolved here rather than reaching the prompt
+        // verbatim as the two characters `\` and `n`.
+        expect(result!.connector).toBe("## Key findings\n\n{output}");
+    });
+
+    it("resolves tab and quote escapes in connector", () => {
+        const content = `---\nname: scout\ndescription: Fast recon\ntools: read,ls\nmodel: deepseek-v4-flash\nthinking: medium\nconnector: "## \\"Findings\\"\\tsummary:\\n{output}"\n---\nYou are a scout agent.`;
+        const result = parseAgentMd(content, "agents/scout.md");
+        expect(result!.connector).toBe('## "Findings"\tsummary:\n{output}');
+    });
+
+    it("treats a doubled backslash as a literal backslash, not an escape", () => {
+        const content = `---\nname: scout\ndescription: Fast recon\ntools: read,ls\nmodel: deepseek-v4-flash\nthinking: medium\nconnector: "C:\\\\nested\\n{output}"\n---\nYou are a scout agent.`;
+        const result = parseAgentMd(content, "agents/scout.md");
+        // `\\` collapses to a single backslash and the following `n` stays a
+        // plain character — only the standalone `\n` becomes a newline.
+        expect(result!.connector).toBe("C:\\nested\n{output}");
+    });
+
+    it("preserves unrecognized escape sequences as written", () => {
+        const content = `---\nname: scout\ndescription: Fast recon\ntools: read,ls\nmodel: deepseek-v4-flash\nthinking: medium\nconnector: "100\\% done\\n{output}"\n---\nYou are a scout agent.`;
+        const result = parseAgentMd(content, "agents/scout.md");
+        expect(result!.connector).toBe("100\\% done\n{output}");
     });
 
     it("returns undefined connector when not present", () => {

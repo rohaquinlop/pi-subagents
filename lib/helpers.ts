@@ -18,6 +18,30 @@ export function normalizeTools(tools: string | string[]): string[] {
 }
 
 /**
+ * Resolves backslash escape sequences in a single-line frontmatter value.
+ *
+ * Frontmatter is read line by line, so a multi-line template has to be written
+ * with escapes: `connector: "## Header\n\n{output}"`. Without this step those
+ * two characters reach the prompt verbatim and the header renders as
+ * `## Header\n\n<output>` on one line.
+ *
+ * Runs in a single pass so `\\n` yields a literal backslash followed by `n`
+ * rather than a newline. Unrecognized escapes are preserved as written.
+ */
+function unescapeFrontmatterValue(value: string): string {
+    return value.replace(/\\(.)/g, (_match, ch: string) => {
+        switch (ch) {
+            case "n": return "\n";
+            case "t": return "\t";
+            case "r": return "\r";
+            case "\\": return "\\";
+            case '"': return '"';
+            default: return `\\${ch}`;
+        }
+    });
+}
+
+/**
  * Parses a markdown file with YAML frontmatter into an AgentConfig.
  * Returns null if the file has no valid frontmatter or is missing required fields.
  */
@@ -51,7 +75,7 @@ export function parseAgentMd(content: string, filePath: string): AgentConfig | n
         ? normalizeTools(fields.subagent_agents)
         : undefined;
     const connector = fields.connector
-        ? fields.connector.replace(/^"|"$/g, "")
+        ? unescapeFrontmatterValue(fields.connector.replace(/^"|"$/g, ""))
         : undefined;
 
     return { name, description, tools, model, thinking, systemPrompt, filePath, subagentAgents, connector };
