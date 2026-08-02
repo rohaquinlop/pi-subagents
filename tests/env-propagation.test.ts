@@ -57,6 +57,19 @@ describe("buildChildEnv", () => {
 		expect(env.PI_SUBAGENT_DEPTH).toBe("2");
 	});
 
+	it("passes PI_SUBAGENT_INHERIT_MODEL down so nested `model: inherit` resolves", () => {
+		const env = buildChildEnv({
+			PI_IS_SUBAGENT: "1",
+			PI_SUBAGENT_INHERIT_MODEL: "xiaomi/mimo-v2.5",
+		});
+		expect(env.PI_SUBAGENT_INHERIT_MODEL).toBe("xiaomi/mimo-v2.5");
+	});
+
+	it("allowlists PI_SUBAGENT_INHERIT_MODEL so it survives another hop", () => {
+		// A grandchild inherits it from the child's environment, not from overrides.
+		expect(ENV_ALLOWLIST_BASE.has("PI_SUBAGENT_INHERIT_MODEL")).toBe(true);
+	});
+
 	it("overrides take precedence over allowlisted values", () => {
 		process.env.PI_IS_SUBAGENT = "original";
 		const env = buildChildEnv({ PI_IS_SUBAGENT: "overridden" });

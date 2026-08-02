@@ -23,6 +23,7 @@ import { detectCycle, LOOP_ERROR_PREFIX } from "./lib/loop-detector";
 import { extractCycleSignature, LOOP_PRIOR_ITERATIONS_HEADER } from "./lib/cycle-signature";
 import { validateAgentGraphAcyclicity } from "./lib/agent-graph";
 import { checkDepth } from "./lib/depth-limit";
+import { resolveAgentModel, formatModelSpec } from "./lib/model-tiers";
 
 interface ToolEvent {
 	tool: string;
@@ -93,6 +94,7 @@ interface ExtensionConfig {
 	envExtra?: Record<string, string>; // extra key-value pairs to inject into child process env
 	extraDangerousPatterns?: string[]; // additional regex patterns to block in safe_bash
 	safeCommands?: string[];         // commands to always allow in safe_bash
+	modelTiers?: Record<string, string>; // tier name → model spec, for `model: $tier` in agent files
 }
 
 const EXT_DIR = path.dirname(new URL(import.meta.url).pathname);
@@ -104,6 +106,16 @@ const DEFAULT_SUBAGENT_TIMEOUT_MS = 600_000;     // 10 minutes
 const DEFAULT_SUBAGENT_IDLE_TIMEOUT_MS = 300_000; // 5 minutes
 
 let extensionConfig: ExtensionConfig = {};
+
+/**
+ * The session's current model as "provider/id", used to resolve `model: inherit`.
+ *
+ * Seeded from PI_SUBAGENT_INHERIT_MODEL so a nested subagent inherits the model
+ * the top-level session chose rather than losing the reference one level down,
+ * then refreshed from `ctx.model` on every dispatch — the user can switch models
+ * mid-session with /model.
+ */
+let sessionModelSpec: string | undefined = process.env.PI_SUBAGENT_INHERIT_MODEL || undefined;
 
 function loadConfig(): ExtensionConfig {
 	try {
@@ -119,6 +131,7 @@ export const ENV_ALLOWLIST_BASE = new Set([
 	"TMPDIR", "TEMP", "TMP",
 	"NODE_OPTIONS", "NODE_PATH",
 	"PI_IS_SUBAGENT", "PI_SUBAGENT_ALLOWED", "PI_SUBAGENT_DEPTH",
+	"PI_SUBAGENT_INHERIT_MODEL",
 	"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY",
 	"GOOGLE_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
 	"MISTRAL_API_KEY", "COHERE_API_KEY", "XAI_API_KEY",
@@ -416,6 +429,30 @@ function matchModelPattern(model: string, pattern: string): boolean {
 	return regex.test(modelId);
 }
 
+/**
+ * Resolve an agent's `model:` field to a concrete "provider/id" spec.
+ *
+ * Agent files may name a tier (`$fast`) or `inherit` instead of a fixed model,
+ * so nothing downstream — the `--models` flag, model-specific extension
+ * matching, the context-window lookup — should ever see an unresolved spec.
+ * Returns a copy so the discovered AgentConfig stays as authored; the same
+ * agent can resolve differently after the user switches models mid-session.
+ *
+ * Throws with the agent named, because a mistyped tier is a configuration error
+ * the user needs to see rather than a silent fallback to some default model.
+ */
+function resolveAgentForDispatch(agent: AgentConfig): AgentConfig {
+	const resolution = resolveAgentModel(agent.model, {
+		tiers: extensionConfig.modelTiers,
+		sessionModel: sessionModelSpec,
+	});
+	if (!resolution.ok) {
+		throw new Error(`Agent '${agent.name}' (${agent.filePath}): ${resolution.error}`);
+	}
+	if (resolution.model === agent.model) return agent;
+	return { ...agent, model: resolution.model };
+}
+
 async function buildPiArgs(
 	agent: AgentConfig,
 	task: string,
@@ -514,6 +551,11 @@ async function buildPiArgs(
 
 	overrides.PI_SUBAGENT_DEPTH = String(depthResult.newDepth);
 
+	// Carry the session model down so a nested `model: inherit` still resolves.
+	// Without this the reference is lost at the first hop, since the child has no
+	// ctx.model of its own until it picks one.
+	if (sessionModelSpec) overrides.PI_SUBAGENT_INHERIT_MODEL = sessionModelSpec;
+
 	if (extensionConfig.envExtra) Object.assign(overrides, extensionConfig.envExtra);
 	const childEnv = buildChildEnv(overrides, extensionConfig.envAllowlist);
 
@@ -569,12 +611,15 @@ function extractToolArgsPreview(args: Record<string, unknown>): string {
 }
 
 async function runSubagent(
-	agent: AgentConfig,
+	rawAgent: AgentConfig,
 	task: string,
 	cwd: string,
 	signal: AbortSignal | undefined,
 	onUpdate?: (progress: AgentProgress, usage: AgentResult["usage"], finalExitCode?: number) => void,
 ): Promise<AgentResult> {
+	// Resolve `$tier` / `inherit` once, here, so every downstream consumer —
+	// spawn args, result metadata, the TUI — sees the same concrete model.
+	const agent = resolveAgentForDispatch(rawAgent);
 	const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd);
 	const command = args[0];
 	const spawnArgs = args.slice(1);
@@ -1537,14 +1582,19 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`Unknown agent: ${params.agent}. Available agents: ${available}`);
 			}
 
-			const [provider, modelId] = (agent.model || "").split("/");
+			// Refresh before resolving: the user may have switched models with
+			// /model since the last dispatch, and `inherit` should follow that.
+			sessionModelSpec = formatModelSpec(ctx.model) ?? sessionModelSpec;
+			const resolvedAgent = resolveAgentForDispatch(agent);
+
+			const [provider, modelId] = (resolvedAgent.model || "").split("/");
 			const contextWindow = provider && modelId ? ctx.modelRegistry.find(provider, modelId)?.contextWindow : undefined;
 			const liveResult: AgentResult = {
 				agent: params.agent,
 				task: params.task,
 				output: "",
 				exitCode: -1,
-				model: agent.model,
+				model: resolvedAgent.model,
 				contextWindow,
 				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
 				progress: { agent: params.agent, status: "running" as const, task: params.task, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
@@ -1679,6 +1729,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const cwd = params.cwd ?? ctx.cwd;
+			sessionModelSpec = formatModelSpec(ctx.model) ?? sessionModelSpec;
 
 			if (!params.steps || params.steps.length < 2) {
 				throw new Error("pipeline requires at least 2 steps");
@@ -1810,6 +1861,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const cwd = params.cwd ?? ctx.cwd;
+			sessionModelSpec = formatModelSpec(ctx.model) ?? sessionModelSpec;
 			const maxIterations = params.max_iterations ?? 3;
 
 			// Validate agent exists
