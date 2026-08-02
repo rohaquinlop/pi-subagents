@@ -84,6 +84,30 @@ Optional `config.json` next to `index.ts`:
 { "maxConcurrency": 4 }
 ```
 
+### Model tiers
+
+Pinning a concrete model in every agent file couples the whole fleet to one
+provider — switching means editing each file. Define tiers instead:
+
+```json
+{
+  "modelTiers": {
+    "fast": "deepseek/deepseek-v4-flash",
+    "deep": "deepseek/deepseek-v4-pro"
+  }
+}
+```
+
+Agent files then reference a tier by role, and one config edit repoints them all:
+
+```yaml
+model: $fast
+```
+
+A tier may point at another tier, or at `inherit`. Cycles are detected and
+reported rather than followed. An undefined tier fails the dispatch with the
+agent named — it never falls back to some default model.
+
 ## Output
 
 Subagents return text only — there's no file handoff. If the parent needs artifacts, instruct the subagent to `write` them and return the path.
@@ -120,8 +144,8 @@ Frontmatter fields:
 - **name** (required) — unique agent name, used in `{ agent: "my-agent" }` calls
 - **description** — short description
 - **tools** — comma-separated list of tools the agent needs (builtin or extension). Include `subagent` here to let this agent spawn other agents.
-- **model** — provider-agnostic model identifier (e.g. `deepseek-v4-flash`). Pi resolves it from any registered provider that serves it.
-- **thinking** — reasoning level: `off`, `low`, `medium`, `high` (defaults to `medium`)
+- **model** (required) — provider-agnostic model identifier (e.g. `deepseek-v4-flash`). Pi resolves it from any registered provider that serves it. Two indirections avoid pinning a provider here: `inherit` uses whatever model the session is currently on (and follows `/model` switches), and `$name` looks up a tier from [`modelTiers`](#model-tiers). Nested subagents inherit the top-level session model via `PI_SUBAGENT_INHERIT_MODEL`.
+- **thinking** (required) — reasoning level: `off`, `low`, `medium`, `high`. A file missing this is skipped during discovery, same as one missing `name`, `description`, `tools` or `model`.
 - **subagent_agents** — if `subagent` is in `tools`, restrict which agents this one may spawn. Comma-separated list of agent names. Omit for no restriction. Enforced by passing `PI_SUBAGENT_ALLOWED` env to the child `pi` process — the child's subagents extension filters its registry before any tool description sees it, so the child LLM literally can't reference an agent outside the allowlist.
 
 The markdown body becomes the agent's system prompt.
