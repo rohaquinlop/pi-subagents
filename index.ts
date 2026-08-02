@@ -24,6 +24,7 @@ import { extractCycleSignature, LOOP_PRIOR_ITERATIONS_HEADER } from "./lib/cycle
 import { validateAgentGraphAcyclicity } from "./lib/agent-graph";
 import { checkDepth } from "./lib/depth-limit";
 import { resolveAgentModel, formatModelSpec } from "./lib/model-tiers";
+import { resolveConfigPaths, loadExtensionConfig, type ExtensionConfig } from "./lib/config";
 
 interface ToolEvent {
 	tool: string;
@@ -84,23 +85,13 @@ interface Details {
 }
 
 // ── Config ─────────────────────────────────────────────────────────────
-
-interface ExtensionConfig {
-	maxConcurrency?: number;
-	subagentTimeoutMs?: number;      // wall-clock, default 600000 (10 min). 0 = disabled.
-	subagentIdleTimeoutMs?: number;  // no-stdout watchdog, default 300000 (5 min). 0 = disabled.
-	maxSubagentDepth?: number;       // max nesting depth, default 8. Hard backstop against recursion loops.
-	envAllowlist?: string[];         // additional env var names to pass through to child processes
-	envExtra?: Record<string, string>; // extra key-value pairs to inject into child process env
-	extraDangerousPatterns?: string[]; // additional regex patterns to block in safe_bash
-	safeCommands?: string[];         // commands to always allow in safe_bash
-	modelTiers?: Record<string, string>; // tier name → model spec, for `model: $tier` in agent files
-}
+//
+// The ExtensionConfig shape and file resolution live in lib/config.ts.
 
 const EXT_DIR = path.dirname(new URL(import.meta.url).pathname);
 const AGENTS_DIR = path.join(EXT_DIR, "agents");
 const TOOLS_DIR = path.join(EXT_DIR, "tools");
-const CONFIG_PATH = path.join(EXT_DIR, "config.json");
+const CONFIG_PATHS = resolveConfigPaths(EXT_DIR, process.env.HOME);
 const DEFAULT_MAX_CONCURRENCY = 4;
 const DEFAULT_SUBAGENT_TIMEOUT_MS = 600_000;     // 10 minutes
 const DEFAULT_SUBAGENT_IDLE_TIMEOUT_MS = 300_000; // 5 minutes
@@ -118,12 +109,7 @@ let extensionConfig: ExtensionConfig = {};
 let sessionModelSpec: string | undefined = process.env.PI_SUBAGENT_INHERIT_MODEL || undefined;
 
 function loadConfig(): ExtensionConfig {
-	try {
-		if (fs.existsSync(CONFIG_PATH)) {
-			return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")) as ExtensionConfig;
-		}
-	} catch {}
-	return {};
+	return loadExtensionConfig(CONFIG_PATHS);
 }
 
 export const ENV_ALLOWLIST_BASE = new Set([
