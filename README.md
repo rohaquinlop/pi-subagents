@@ -78,16 +78,27 @@ The judge evaluates each iteration's output. When satisfied (YES), the loop stop
 
 ## Config
 
-Optional `config.json` next to `index.ts`:
+Config is read from two locations, the second overriding the first:
+
+1. `config.json` next to `index.ts` — inside `node_modules`, so it is usually
+   gitignored and is **replaced whenever the package updates**. Fine for a
+   throwaway local tweak.
+2. `~/.pi/agent/pi-subagents.config.json` — survives updates and can be tracked
+   alongside the rest of your pi config. Put anything you want to keep here.
 
 ```json
 { "maxConcurrency": 4 }
 ```
 
+Merging is shallow: a key set in the user file replaces the package file's value
+outright. A malformed file is skipped with a warning rather than silently
+dropping your settings.
+
 ### Model tiers
 
 Pinning a concrete model in every agent file couples the whole fleet to one
-provider — switching means editing each file. Define tiers instead:
+provider — switching means editing each file. Define tiers instead, in
+`~/.pi/agent/pi-subagents.config.json` so they survive package updates:
 
 ```json
 {
@@ -263,7 +274,8 @@ Matching is case-insensitive.
 @rohaquinlop/pi-subagents/
 ├── index.ts           # Extension entry point
 ├── agents/            # Built-in agent configs (frontmatter + system prompt)
-├── lib/               # Pure helper functions (agent discovery, frontmatter parsing)
+├── lib/               # Pure helper functions (agent discovery, frontmatter parsing,
+│                      #   config loading, model tier resolution)
 └── tools/             # Extensions loaded into subagent processes
     └── safe-bash.ts   # bash with dangerous command blocking
 ```
